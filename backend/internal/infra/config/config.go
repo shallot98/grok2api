@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -138,6 +139,8 @@ type AuthConfig struct {
 	AccessTokenTTL  Duration `yaml:"accessTokenTTL"`
 	RefreshTokenTTL Duration `yaml:"refreshTokenTTL"`
 	SecureCookies   bool     `yaml:"secureCookies"`
+	TrustedLoginIPs []string `yaml:"trustedLoginIPs"`
+	TrustedProxies  []string `yaml:"trustedProxies"`
 }
 
 type ProviderConfig struct {
@@ -527,6 +530,12 @@ func (c Config) Validate() error {
 	if c.Auth.AccessTokenTTL.Value() <= 0 || c.Auth.RefreshTokenTTL.Value() <= 0 {
 		return errors.New("JWT 有效期必须大于零")
 	}
+	if err := validateTrustedLoginIPs(c.Auth.TrustedLoginIPs); err != nil {
+		return err
+	}
+	if err := validateTrustedProxies(c.Auth.TrustedProxies); err != nil {
+		return err
+	}
 	if err := validateAPIBaseURL("provider.build.baseURL", c.Provider.Build.BaseURL, false); err != nil {
 		return err
 	}
@@ -733,6 +742,45 @@ func validUniquePositiveIDs(values []uint64) bool {
 		seen[value] = struct{}{}
 	}
 	return true
+}
+
+func validateTrustedLoginIPs(values []string) error {
+	seen := make(map[string]struct{}, len(values))
+	for _, raw := range values {
+		value := strings.TrimSpace(raw)
+		if value == "" {
+			return errors.New("auth.trustedLoginIPs 不能包含空项")
+		}
+		ip := net.ParseIP(value)
+		if ip == nil {
+			return fmt.Errorf("auth.trustedLoginIPs 含有无效 IP: %s", value)
+		}
+		key := ip.String()
+		if _, exists := seen[key]; exists {
+			return fmt.Errorf("auth.trustedLoginIPs 含有重复 IP: %s", value)
+		}
+		seen[key] = struct{}{}
+	}
+	return nil
+}
+
+func validateTrustedProxies(values []string) error {
+	for _, raw := range values {
+		value := strings.TrimSpace(raw)
+		if value == "" {
+			return errors.New("auth.trustedProxies 不能包含空项")
+		}
+		if strings.Contains(value, "/") {
+			if _, _, err := net.ParseCIDR(value); err != nil {
+				return fmt.Errorf("auth.trustedProxies 含有无效 CIDR: %s", value)
+			}
+			continue
+		}
+		if net.ParseIP(value) == nil {
+			return fmt.Errorf("auth.trustedProxies 含有无效 IP: %s", value)
+		}
+	}
+	return nil
 }
 
 // validateAPIBaseURL 仅允许无凭据、query、fragment 的 HTTP(S) API 根地址。
