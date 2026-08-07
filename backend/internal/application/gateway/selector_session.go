@@ -67,6 +67,9 @@ func (s *Selector) beginSelectionSessionForKey(ctx context.Context, provider acc
 
 	for index, candidate := range values {
 		value := candidate.Credential
+		if s.qualityNodeSuspended(value.EgressNodeID) {
+			continue
+		}
 		if !accountScopeAllowsCandidate(provider, accountScope, candidate) {
 			continue
 		}

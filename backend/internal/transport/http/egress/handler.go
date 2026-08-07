@@ -84,7 +84,52 @@ func (h *Handler) RegisterQualityGuard(router *gin.RouterGroup) {
 	router.PATCH("/egress-nodes/batch", h.updateMany)
 	router.POST("/egress-nodes/:id/test", h.testNode)
 	router.POST("/egress-nodes/:id/quality-test", h.testQualityGuardNode)
+	router.PUT("/egress-nodes/:id/quality-suspension", h.updateQualitySuspension)
+	router.POST("/egress-quality-accounts/:id/quarantine", h.quarantineQualityAccount)
 	router.GET("/egress-operations", h.operationsConfig)
+}
+
+type qualitySuspensionRequest struct {
+	Suspended *bool `json:"suspended" binding:"required"`
+}
+
+func (h *Handler) updateQualitySuspension(c *gin.Context) {
+	nodeID, ok := pathID(c)
+	if !ok {
+		return
+	}
+	var request qualitySuspensionRequest
+	if c.ShouldBindJSON(&request) != nil || request.Suspended == nil {
+		response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
+		return
+	}
+	changed, err := h.service.SetQualityNodeSuspended(c.Request.Context(), nodeID, *request.Suspended)
+	if err != nil {
+		h.writeError(c, err)
+		return
+	}
+	response.Success(c, http.StatusOK, gin.H{"changed": changed, "suspended": *request.Suspended})
+}
+
+type qualityAccountQuarantineRequest struct {
+	Model string `json:"model" binding:"required"`
+}
+
+func (h *Handler) quarantineQualityAccount(c *gin.Context) {
+	accountID, ok := pathID(c)
+	if !ok {
+		return
+	}
+	var request qualityAccountQuarantineRequest
+	if c.ShouldBindJSON(&request) != nil {
+		response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
+		return
+	}
+	if err := h.service.QuarantineQualityAccount(c.Request.Context(), accountID, request.Model); err != nil {
+		h.writeQualityProbeError(c, err)
+		return
+	}
+	response.Success(c, http.StatusOK, gin.H{"quarantined": true})
 }
 
 // A fully populated 2,000-node guard state is slightly larger than 1 MiB.
@@ -362,19 +407,28 @@ func (h *Handler) testQualityGuardNode(c *gin.Context) {
 		response.Error(c, http.StatusServiceUnavailable, "qualityGuardUnavailable", "质量守护配置暂不可用")
 		return
 	}
-	value, err := h.service.ProbeQuality(c.Request.Context(), nodeID, h.guardProbe)
+	probe := h.guardProbe
+	if rawAccountID := strings.TrimSpace(c.Query("accountId")); rawAccountID != "" {
+		accountID, err := strconv.ParseUint(rawAccountID, 10, 64)
+		if err != nil || accountID == 0 {
+			response.Error(c, http.StatusBadRequest, "invalidAccountId", "账号 ID 无效")
+			return
+		}
+		probe.AccountID = accountID
+	}
+	value, err := h.service.ProbeQuality(c.Request.Context(), nodeID, probe)
 	if err != nil {
 		h.writeQualityProbeError(c, err)
 		return
 	}
 	response.Success(c, http.StatusOK, gin.H{
-		"requestId": value.RequestID, "nodeId": strconv.FormatUint(value.NodeID, 10), "model": value.Model,
+		"requestId": value.RequestID, "nodeId": strconv.FormatUint(value.NodeID, 10), "accountId": strconv.FormatUint(value.AccountID, 10), "model": value.Model,
 		"statusCode": value.StatusCode, "firstTokenMs": value.FirstTokenMS, "durationMs": value.DurationMS,
 		"generationMs": value.GenerationMS, "chunkCount": value.ChunkCount,
 		"outputTokens": value.OutputTokens, "reasoningTokens": value.ReasoningTokens,
 		"visibleTokens": value.VisibleTokens, "visibleCharacters": value.VisibleCharacters,
 		"outputTokensPerSecond":  value.OutputTokensPerSecond,
-		"visibleTokensPerSecond": value.OutputTokensPerSecond, "expectedMatched": value.ExpectedMatched,
+		"visibleTokensPerSecond": value.VisibleTokensPerSecond, "expectedMatched": value.ExpectedMatched,
 		"responseSha256": value.ResponseSHA256,
 	})
 }
@@ -476,6 +530,7 @@ type batchNodeUpdateRequest struct {
 
 type qualityProbeRequest struct {
 	ClientKeyID     string `json:"clientKeyId" binding:"required"`
+	AccountID       string `json:"accountId"`
 	Model           string `json:"model" binding:"required"`
 	Prompt          string `json:"prompt"`
 	Expected        string `json:"expected"`
@@ -497,8 +552,16 @@ func (h *Handler) testQuality(c *gin.Context) {
 		response.Error(c, http.StatusBadRequest, "invalidClientKeyId", "Client Key ID 无效")
 		return
 	}
+	var accountID uint64
+	if strings.TrimSpace(request.AccountID) != "" {
+		accountID, err = strconv.ParseUint(request.AccountID, 10, 64)
+		if err != nil || accountID == 0 {
+			response.Error(c, http.StatusBadRequest, "invalidAccountId", "账号 ID 无效")
+			return
+		}
+	}
 	value, err := h.service.ProbeQuality(c.Request.Context(), nodeID, egressapp.QualityProbeInput{
-		ClientKeyID: clientKeyID, Model: request.Model, Prompt: request.Prompt,
+		ClientKeyID: clientKeyID, AccountID: accountID, Model: request.Model, Prompt: request.Prompt,
 		Expected: request.Expected, MaxOutputTokens: request.MaxOutputTokens,
 	})
 	if err != nil {
@@ -506,13 +569,13 @@ func (h *Handler) testQuality(c *gin.Context) {
 		return
 	}
 	response.Success(c, http.StatusOK, gin.H{
-		"requestId": value.RequestID, "nodeId": strconv.FormatUint(value.NodeID, 10), "model": value.Model,
+		"requestId": value.RequestID, "nodeId": strconv.FormatUint(value.NodeID, 10), "accountId": strconv.FormatUint(value.AccountID, 10), "model": value.Model,
 		"statusCode": value.StatusCode, "firstTokenMs": value.FirstTokenMS, "durationMs": value.DurationMS,
 		"generationMs": value.GenerationMS, "chunkCount": value.ChunkCount,
 		"outputTokens": value.OutputTokens, "reasoningTokens": value.ReasoningTokens,
 		"visibleTokens": value.VisibleTokens, "visibleCharacters": value.VisibleCharacters,
 		"outputTokensPerSecond":  value.OutputTokensPerSecond,
-		"visibleTokensPerSecond": value.OutputTokensPerSecond, "expectedMatched": value.ExpectedMatched,
+		"visibleTokensPerSecond": value.VisibleTokensPerSecond, "expectedMatched": value.ExpectedMatched,
 		"responseSha256": value.ResponseSHA256,
 	})
 }

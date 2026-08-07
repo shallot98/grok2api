@@ -77,6 +77,7 @@ func (s *Service) ProbeEgressQuality(ctx context.Context, nodeID uint64, input e
 	result, err := s.CreateChatCompletion(probeCtx, Input{
 		RequestID: requestID, ClientKey: key, PublicModel: publicModel, Body: body,
 		Streaming: true, Operation: audit.OperationChat, ForcedEgressNodeID: nodeID,
+		ForcedAccountID: input.AccountID,
 	})
 	if err != nil {
 		return egressapp.QualityProbeResult{}, normalizeQualityProbeRequestError(err)
@@ -157,7 +158,6 @@ func (s *Service) ProbeEgressQuality(ctx context.Context, nodeID uint64, input e
 	completedAt := time.Now()
 	text := visible.String()
 	visibleCharacters := utf8.RuneCountInString(text)
-	// Visible tokens are diagnostic only; TPS intentionally uses total output tokens to match the audit panel.
 	visibleTokens := usage.OutputTokens - usage.ReasoningTokens
 	if visibleTokens <= 0 && visibleCharacters > 0 {
 		visibleTokens = int64((visibleCharacters + 3) / 4)
@@ -174,18 +174,46 @@ func (s *Service) ProbeEgressQuality(ctx context.Context, nodeID uint64, input e
 			generationMS = 1
 		}
 	}
-	var outputTokensPerSecond float64
+	var outputTokensPerSecond, visibleTokensPerSecond float64
 	if !firstGeneratedAt.IsZero() {
-		outputTokensPerSecond = qualityProbeOutputTokensPerSecond(usage.OutputTokens, durationMS, firstTokenMS)
+		outputTokensPerSecond = qualityProbeTokensPerSecond(usage.OutputTokens, durationMS)
+		visibleTokensPerSecond = qualityProbeTokensPerSecond(visibleTokens, generationMS)
 	}
 	digest := sha256.Sum256([]byte(text))
 	return egressapp.QualityProbeResult{
-		RequestID: requestID, NodeID: nodeID, Model: input.Model, StatusCode: result.StatusCode,
+		RequestID: requestID, NodeID: nodeID, AccountID: result.AccountID, Model: input.Model, StatusCode: result.StatusCode,
 		FirstTokenMS: firstTokenMS, DurationMS: durationMS, GenerationMS: generationMS,
 		ChunkCount: chunkCount, OutputTokens: usage.OutputTokens, ReasoningTokens: usage.ReasoningTokens,
-		VisibleTokens: visibleTokens, VisibleCharacters: visibleCharacters, OutputTokensPerSecond: outputTokensPerSecond,
+		VisibleTokens: visibleTokens, VisibleCharacters: visibleCharacters,
+		OutputTokensPerSecond: outputTokensPerSecond, VisibleTokensPerSecond: visibleTokensPerSecond,
 		ExpectedMatched: strings.Contains(text, input.Expected), ResponseSHA256: hex.EncodeToString(digest[:]),
 	}, nil
+}
+
+func (s *Service) QuarantineQualityAccount(ctx context.Context, accountID uint64, model string, cooldown time.Duration) error {
+	publicModel, ok := qualityProbeBuildPublicModel(model)
+	if !ok || accountID == 0 {
+		return fmt.Errorf("%w: 质量账号或模型无效", egressapp.ErrInvalidInput)
+	}
+	route, err := s.models.GetByPublicID(ctx, publicModel)
+	if err != nil {
+		return fmt.Errorf("读取质量探测模型: %w", err)
+	}
+	if route.Provider != accountdomain.ProviderBuild {
+		return fmt.Errorf("%w: 质量账号冷却仅支持 Grok Build", egressapp.ErrInvalidInput)
+	}
+	credential, err := s.selector.accounts.Get(ctx, accountID)
+	if err != nil {
+		return fmt.Errorf("读取质量探测账号: %w", err)
+	}
+	if credential.Provider != accountdomain.ProviderBuild {
+		return fmt.Errorf("%w: 质量账号不属于 Grok Build", egressapp.ErrInvalidInput)
+	}
+	return s.selector.MarkModelQualityDegraded(ctx, credential, route.UpstreamModel, cooldown)
+}
+
+func (s *Service) SetQualityNodeSuspended(nodeID uint64, suspended bool) {
+	s.selector.SetQualityNodeSuspended(nodeID, suspended)
 }
 
 func qualityProbeBuildPublicModel(value string) (string, bool) {
@@ -199,10 +227,9 @@ func normalizeQualityProbeRequestError(err error) error {
 	return err
 }
 
-func qualityProbeOutputTokensPerSecond(outputTokens, durationMS, firstTokenMS int64) float64 {
-	generationMS := durationMS - firstTokenMS
-	if outputTokens <= 0 || generationMS <= 0 {
+func qualityProbeTokensPerSecond(tokens, durationMS int64) float64 {
+	if tokens <= 0 || durationMS <= 0 {
 		return 0
 	}
-	return float64(outputTokens) * 1000 / float64(generationMS)
+	return float64(tokens) * 1000 / float64(durationMS)
 }

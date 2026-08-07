@@ -10,7 +10,10 @@ const (
 	ModePool   Mode = "pool"
 )
 
-const LastErrorTransport = "transport error"
+const (
+	LastErrorTransport             = "transport error"
+	LastErrorQualityGuardSuspended = "quality guard suspended"
+)
 
 type Scope string
 

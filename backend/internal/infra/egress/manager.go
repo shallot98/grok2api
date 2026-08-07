@@ -832,6 +832,9 @@ func (m *Manager) acquire(ctx context.Context, scope domain.Scope, affinity stri
 				return m.acquireUnavailableFallback(ctx, scope, affinity, allowDirect, encryptedCredentialCookies, managedClearance, fmt.Errorf("绑定出口节点 %d 与 %s 作用域不兼容", boundNodeID, scope))
 			}
 			if !selected.Enabled && !qualityProbe {
+				if selected.LastError == domain.LastErrorQualityGuardSuspended {
+					return nil, true, fmt.Errorf("绑定出口节点 %d 已被质量守护暂停", boundNodeID)
+				}
 				return m.acquireUnavailableFallback(ctx, scope, affinity, allowDirect, encryptedCredentialCookies, managedClearance, fmt.Errorf("绑定出口节点 %d 已禁用", boundNodeID))
 			}
 			if strings.TrimSpace(selected.EncryptedProxyURL) == "" {
