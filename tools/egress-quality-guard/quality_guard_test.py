@@ -265,6 +265,37 @@ class GuardTests(unittest.TestCase):
             self.assertEqual(guard.state["statistics"]["actions"]["quarantined"], 1)
             self.assertEqual(guard.state["statistics"]["actions"]["restored"], 1)
 
+    def test_recovery_repairs_lost_backend_suspension_ownership(self):
+        class LostOwnershipApi(FakeApi):
+            def __init__(self, nodes, results):
+                super().__init__(nodes, results)
+                self.restore_attempted = False
+
+            def set_suspended(self, node_id, suspended):
+                if not suspended and not self.restore_attempted:
+                    self.restore_attempted = True
+                    raise quality_guard.ApiError(400, "invalidEgressNode", "ownership lost")
+                return super().set_suspended(node_id, suspended)
+
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = config(
+                state_file=Path(directory) / "state.json",
+                lock_file=Path(directory) / "lock",
+                node_ids=("1",),
+            )
+            nodes = self.nodes()
+            nodes[0]["enabled"] = False
+            good = {"expectedMatched": True, "outputTokens": 100, "outputTokensPerSecond": 100}
+            api = LostOwnershipApi(nodes, [good])
+            guard = quality_guard.Guard(cfg, api)
+            state = guard._state_for("1")
+            state.update({"disabled_by_guard": True, "quarantined_until": 0})
+
+            guard.run_active_cycle()
+
+            self.assertEqual(api.enabled_calls, [("1", False), ("1", True)])
+            self.assertFalse(state["disabled_by_guard"])
+
     def test_active_cycle_bounds_parallel_probe_fetches(self):
         class ConcurrentApi(FakeApi):
             def __init__(self, nodes):

@@ -641,6 +641,18 @@ class Guard:
     def _probe_account_unavailable(exc: Exception) -> bool:
         return isinstance(exc, ApiError) and exc.code == "egressQualityProbeNoAccount"
 
+    def _restore_suspended(self, node_id: str) -> bool:
+        try:
+            return self.api.set_suspended(node_id, False)
+        except ApiError as exc:
+            if exc.status != 400 or exc.code != "invalidEgressNode":
+                raise
+        # A successful recovery request may have cleared the persisted health
+        # reason on older backends. Reassert guard ownership before restoring.
+        if not self.api.set_suspended(node_id, True):
+            raise RuntimeError("quality suspension ownership could not be repaired")
+        return self.api.set_suspended(node_id, False)
+
     def _quarantine(
         self,
         nodes: list[dict[str, Any]],
@@ -870,7 +882,7 @@ class Guard:
                 continue
             if classification == "healthy":
                 state["last_attribution"] = "ip" if affected_account_id else "node"
-                changed = self.api.set_suspended(node_id, False)
+                changed = self._restore_suspended(node_id)
                 if not changed:
                     log_event("restore_not_applied", node_id=node_id, node_name=node.get("name"))
                     return
@@ -917,7 +929,7 @@ class Guard:
                 if sentinel_classification == "healthy":
                     state["last_attribution"] = "account"
                     state["last_reason"] = "account_quality_degraded"
-                    changed = self.api.set_suspended(node_id, False)
+                    changed = self._restore_suspended(node_id)
                     if not changed:
                         log_event("restore_not_applied", node_id=node_id, node_name=node.get("name"))
                         return

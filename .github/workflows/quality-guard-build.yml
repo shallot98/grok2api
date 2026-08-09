@@ -1,6 +1,9 @@
 name: Quality Guard Build
 
 on:
+  push:
+    branches:
+      - ci/quality-guard-immediate-rotation
   workflow_dispatch:
     inputs:
       ref:

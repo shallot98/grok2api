@@ -1117,6 +1117,28 @@ func createHealthyEgressNodeForScope(t *testing.T, ctx context.Context, reposito
 	return created
 }
 
+func TestHealthUpdatePreservesQualityGuardSuspension(t *testing.T) {
+	ctx := context.Background()
+	database := openTestDatabase(t)
+	repository := NewEgressRepository(database)
+	node := createHealthyEgressNode(t, ctx, repository, egressOperationsCipher(t), "quality-suspended", 0)
+	node.Enabled = false
+	node.LastError = egress.LastErrorQualityGuardSuspended
+	if _, err := repository.UpdateEgressNode(ctx, node); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.UpdateEgressNodeHealth(ctx, node.ID, 1, 0, nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := repository.GetEgressNode(ctx, node.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Enabled || updated.LastError != egress.LastErrorQualityGuardSuspended {
+		t.Fatalf("node enabled=%v last_error=%q", updated.Enabled, updated.LastError)
+	}
+}
+
 func setEgressProbeFamilies(t *testing.T, ctx context.Context, repository *EgressRepository, node egress.Node, ipv4, ipv6 egress.ProbeStatus) {
 	t.Helper()
 	now := time.Now().UTC()
