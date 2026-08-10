@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"time"
 
@@ -13,12 +14,14 @@ import (
 )
 
 var (
-	ErrInvalidCredentials = errors.New("管理员账号或密码错误")
-	ErrInvalidSession     = errors.New("管理员会话无效")
-	ErrBootstrapRequired  = errors.New("首次启动需要设置管理员账号和密码")
-	ErrInvalidPassword    = errors.New("新密码至少需要 8 个字符")
-	ErrLoginRateLimited   = errors.New("管理员登录尝试过于频繁")
-	ErrRuntimeUnavailable = errors.New("管理员认证运行态暂不可用")
+	ErrInvalidCredentials  = errors.New("管理员账号或密码错误")
+	ErrInvalidSession      = errors.New("管理员会话无效")
+	ErrBootstrapRequired   = errors.New("首次启动需要设置管理员账号和密码")
+	ErrInvalidPassword     = errors.New("新密码至少需要 8 个字符")
+	ErrLoginRateLimited    = errors.New("管理员登录尝试过于频繁")
+	ErrRuntimeUnavailable  = errors.New("管理员认证运行态暂不可用")
+	ErrTrustedLoginDenied  = errors.New("当前 IP 不允许免密登录")
+	ErrTrustedLoginNoAdmin = errors.New("尚未初始化管理员账号")
 )
 
 type Tokens struct {
@@ -37,14 +40,39 @@ type Service struct {
 	refreshTTL        time.Duration
 	loginLimiter      repository.RateLimiter
 	dummyPasswordHash string
+	trustedLoginIPs   map[string]struct{}
 }
 
 func NewService(admins repository.AdminRepository, sessions repository.AdminSessionRepository, tokens *security.TokenService, accessTTL, refreshTTL time.Duration) *Service {
 	dummyHash, _ := security.HashPassword("grok2api-invalid-admin-password")
-	return &Service{admins: admins, sessions: sessions, tokens: tokens, accessTTL: accessTTL, refreshTTL: refreshTTL, dummyPasswordHash: dummyHash}
+	return &Service{admins: admins, sessions: sessions, tokens: tokens, accessTTL: accessTTL, refreshTTL: refreshTTL, dummyPasswordHash: dummyHash, trustedLoginIPs: map[string]struct{}{}}
 }
 
 func (s *Service) SetLoginRateLimiter(limiter repository.RateLimiter) { s.loginLimiter = limiter }
+
+// SetTrustedLoginIPs 配置允许免密登录的来源 IP；非法项会被忽略（配置层应已校验）。
+func (s *Service) SetTrustedLoginIPs(ips []string) {
+	trusted := make(map[string]struct{}, len(ips))
+	for _, raw := range ips {
+		if key := normalizeIP(raw); key != "" {
+			trusted[key] = struct{}{}
+		}
+	}
+	s.trustedLoginIPs = trusted
+}
+
+// IsTrustedLoginIP 判断来源 IP 是否在免密白名单中。
+func (s *Service) IsTrustedLoginIP(remoteAddress string) bool {
+	if len(s.trustedLoginIPs) == 0 {
+		return false
+	}
+	key := normalizeIP(remoteAddress)
+	if key == "" {
+		return false
+	}
+	_, ok := s.trustedLoginIPs[key]
+	return ok
+}
 
 // Bootstrap 在数据库没有管理员时创建唯一管理员。
 func (s *Service) Bootstrap(ctx context.Context, username, password string) error {
@@ -82,6 +110,25 @@ func (s *Service) Login(ctx context.Context, username, password, remoteAddress s
 	}
 	if !security.VerifyPassword(value.PasswordHash, password) {
 		return admin.Admin{}, Tokens{}, ErrInvalidCredentials
+	}
+	tokens, _, err := s.createSession(ctx, value.ID)
+	return value, tokens, err
+}
+
+// LoginByTrustedIP 在来源 IP 命中白名单时，为系统唯一管理员签发会话，无需密码。
+func (s *Service) LoginByTrustedIP(ctx context.Context, remoteAddress string) (admin.Admin, Tokens, error) {
+	if !s.IsTrustedLoginIP(remoteAddress) {
+		return admin.Admin{}, Tokens{}, ErrTrustedLoginDenied
+	}
+	if err := s.checkTrustedLoginRate(ctx, remoteAddress); err != nil {
+		return admin.Admin{}, Tokens{}, err
+	}
+	value, err := s.admins.GetFirst(ctx)
+	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			return admin.Admin{}, Tokens{}, ErrTrustedLoginNoAdmin
+		}
+		return admin.Admin{}, Tokens{}, fmt.Errorf("%w: %v", ErrRuntimeUnavailable, err)
 	}
 	tokens, _, err := s.createSession(ctx, value.ID)
 	return value, tokens, err
@@ -228,4 +275,39 @@ func (s *Service) checkLoginRate(ctx context.Context, username, remoteAddress st
 		}
 	}
 	return nil
+}
+
+func (s *Service) checkTrustedLoginRate(ctx context.Context, remoteAddress string) error {
+	if s.loginLimiter == nil {
+		return nil
+	}
+	now := time.Now().UTC()
+	key := "admin-trusted-login:ip:" + security.HashToken(normalizeIP(remoteAddress))
+	allowed, err := s.loginLimiter.Allow(ctx, key, 60, now)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrRuntimeUnavailable, err)
+	}
+	if !allowed {
+		return ErrLoginRateLimited
+	}
+	return nil
+}
+
+func normalizeIP(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if host, _, err := net.SplitHostPort(value); err == nil {
+		value = host
+	}
+	value = strings.Trim(value, "[]")
+	ip := net.ParseIP(value)
+	if ip == nil {
+		return ""
+	}
+	if v4 := ip.To4(); v4 != nil {
+		return v4.String()
+	}
+	return ip.String()
 }

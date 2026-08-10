@@ -362,6 +362,7 @@ func (a *Adapter) generateLiteImage(ctx context.Context, request provider.ImageG
 type liteUpstreamError struct {
 	StatusCode int
 	Status     string
+	Header     http.Header
 	Body       []byte
 }
 
@@ -370,7 +371,13 @@ func (e *liteUpstreamError) Error() string {
 }
 
 func (e *liteUpstreamError) Response() *provider.Response {
-	return &provider.Response{StatusCode: e.StatusCode, Status: e.Status, Header: jsonHeaders(), Body: io.NopCloser(bytes.NewReader(e.Body))}
+	header := e.Header.Clone()
+	if header == nil {
+		header = jsonHeaders()
+	} else if header.Get("Content-Type") == "" {
+		header.Set("Content-Type", "application/json; charset=utf-8")
+	}
+	return &provider.Response{StatusCode: e.StatusCode, Status: e.Status, Header: header, Body: io.NopCloser(bytes.NewReader(e.Body))}
 }
 
 func (a *Adapter) generateLiteImageURL(ctx context.Context, credential account.Credential, spec ModelSpec, prompt string) (string, error) {
@@ -410,9 +417,26 @@ func (a *Adapter) generateLiteImageURL(ctx context.Context, credential account.C
 					"type":    "rate_limit_error",
 					"code":    "usage_limit_reached",
 				}})
+				// Temporary product/IP rate limits are not day-long chat window exhaustion.
+				// Advertise a short cooldown so the gateway can isolate only this model.
+				response.Header.Set("Retry-After", "900")
 				body, _ := io.ReadAll(response.Body)
 				_ = response.Body.Close()
-				return "", &liteUpstreamError{StatusCode: http.StatusTooManyRequests, Status: "429 Too Many Requests", Body: body}
+				return "", &liteUpstreamError{
+					StatusCode: http.StatusTooManyRequests,
+					Status:     "429 Too Many Requests",
+					Header:     response.Header.Clone(),
+					Body:       body,
+				}
+			}
+			// Soft render failures ("Some content couldn't be rendered") are empty-image outcomes.
+			if isLiteImageRenderFailure(consumeErr) {
+				a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, 0, consumeErr)
+				lease.Release()
+				if attempt == 0 && a.invalidateSignedStatsig(http.MethodPost, statsigTarget) {
+					continue
+				}
+				return "", liteImageNotFoundError(liteCaptureDiagnostics{ErrorMessage: consumeErr.Error()})
 			}
 			status := 0
 			if errors.Is(consumeErr, errWebAntiBot) {
@@ -459,12 +483,43 @@ func (a *Adapter) generateLiteImageURL(ctx context.Context, credential account.C
 				"upstream_error_code", diagnostics.ErrorCode,
 				"upstream_error", diagnostics.ErrorMessage,
 			)
-			return "", fmt.Errorf("Grok Web Lite 响应结束但未解析到最终图片")
+			// soft_stop / empty payload often follows a stale Statsig signature; refresh once.
+			if attempt == 0 && a.invalidateSignedStatsig(http.MethodPost, statsigTarget) {
+				continue
+			}
+			return "", liteImageNotFoundError(diagnostics)
 		}
 		// Lite 上游固定生成两张，但每次查询只计一次 Fast 额度；按旧协议取首张并为 n 重复查询。
 		return parsed.Images[0], nil
 	}
-	return "", fmt.Errorf("Grok Web Lite 图片签名刷新失败")
+	return "", liteImageNotFoundError(liteCaptureDiagnostics{})
+}
+
+func liteImageNotFoundError(diagnostics liteCaptureDiagnostics) *liteUpstreamError {
+	message := "Grok Web Lite 响应结束但未解析到最终图片"
+	if diagnostics.ErrorMessage != "" {
+		message = diagnostics.ErrorMessage
+	}
+	header := jsonHeaders()
+	// Short model cooldown so the gateway rotates to another account instead of
+	// treating this as a systemic network outage.
+	header.Set("Retry-After", "300")
+	body, _ := json.Marshal(map[string]any{"error": map[string]any{
+		"message": message,
+		"type":    "server_error",
+		"code":    "image_generation_empty",
+	}})
+	return &liteUpstreamError{StatusCode: http.StatusBadGateway, Status: "502 Bad Gateway", Header: header, Body: body}
+}
+
+func isLiteImageRenderFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	normalized := strings.ToLower(err.Error())
+	return strings.Contains(normalized, "couldn't be rendered") ||
+		strings.Contains(normalized, "could not be rendered") ||
+		strings.Contains(normalized, "content couldn't be rendered")
 }
 
 func (a *Adapter) forwardLiteChatCompletion(ctx context.Context, request provider.ResponseResourceRequest, input openAIRequest, normalized normalizedChatInput, spec ModelSpec) (*provider.Response, error) {
@@ -487,52 +542,68 @@ func (a *Adapter) forwardLiteChatCompletion(ctx context.Context, request provide
 	if format != "url" && format != "b64_json" {
 		return invalidImageRequest("image_config.response_format 必须是 url 或 b64_json")
 	}
+	// Always materialize images before returning stream headers. Mid-stream pipe
+	// failures surface to clients as abrupt connection closes with no JSON body.
+	items, err := a.generateLiteChatImageItems(ctx, request.Credential, spec, normalized.Prompt, count, format)
+	if err != nil {
+		var upstreamErr *liteUpstreamError
+		if errors.As(err, &upstreamErr) {
+			return upstreamErr.Response(), nil
+		}
+		return nil, err
+	}
 	responseID := newWebID("resp")
+	parsed := parsedChat{ResponseID: responseID, InputTokens: estimateTokens(normalized.Prompt)}
+	for index, item := range items {
+		if index > 0 {
+			parsed.appendText("\n\n")
+		}
+		parsed.appendText(liteImageMarkdown(item))
+	}
 	streaming := input.Stream || request.Streaming
 	if streaming {
 		reader, writer := io.Pipe()
 		streamCtx, cancel := context.WithCancel(ctx)
-		go a.streamLiteChatImages(streamCtx, writer, request.Credential, spec, responseID, input.Model, normalized.Prompt, count, format)
-		return &provider.Response{StatusCode: http.StatusOK, Status: "200 OK", Header: streamHeaders(), Body: &cancelBody{ReadCloser: reader, cancel: cancel}, QuotaUnits: count}, nil
-	}
-	parsed := parsedChat{ResponseID: responseID, InputTokens: estimateTokens(normalized.Prompt)}
-	for range count {
-		rawURL, err := a.generateLiteImageURL(ctx, request.Credential, spec, normalized.Prompt)
-		if err != nil {
-			var upstreamErr *liteUpstreamError
-			if errors.As(err, &upstreamErr) && parsed.Text.Len() == 0 {
-				return upstreamErr.Response(), nil
-			}
-			return nil, err
-		}
-		item, err := a.imageDataItem(ctx, request.Credential, imagineImageValue{URL: rawURL}, format)
-		if err != nil {
-			return nil, err
-		}
-		if parsed.Text.Len() > 0 {
-			parsed.appendText("\n\n")
-		}
-		parsed.appendText(liteImageMarkdown(item))
+		go a.streamLiteChatImageItems(streamCtx, writer, responseID, input.Model, normalized.Prompt, items)
+		return &provider.Response{StatusCode: http.StatusOK, Status: "200 OK", Header: streamHeaders(), Body: &cancelBody{ReadCloser: reader, cancel: cancel}, QuotaUnits: len(items)}, nil
 	}
 	payload := buildOpenAIResult("chat", responseID, input.Model, parsed, false)
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
 	}
-	return &provider.Response{StatusCode: http.StatusOK, Status: "200 OK", Header: jsonHeaders(), Body: io.NopCloser(bytes.NewReader(data)), QuotaUnits: count}, nil
+	return &provider.Response{StatusCode: http.StatusOK, Status: "200 OK", Header: jsonHeaders(), Body: io.NopCloser(bytes.NewReader(data)), QuotaUnits: len(items)}, nil
 }
 
-func (a *Adapter) streamLiteChatImages(ctx context.Context, writer *io.PipeWriter, credential account.Credential, spec ModelSpec, responseID, model, prompt string, count int, format string) {
-	parsed := parsedChat{ResponseID: responseID, InputTokens: estimateTokens(prompt)}
-	writeStreamStart(writer, "chat", responseID, model, parsed.InputTokens)
+func (a *Adapter) generateLiteChatImageItems(ctx context.Context, credential account.Credential, spec ModelSpec, prompt string, count int, format string) ([]map[string]any, error) {
+	items := make([]map[string]any, 0, count)
 	for range count {
 		rawURL, err := a.generateLiteImageURL(ctx, credential, spec, prompt)
 		if err != nil {
-			_ = writer.CloseWithError(err)
-			return
+			if len(items) == 0 {
+				return nil, err
+			}
+			return nil, fmt.Errorf("Lite 图片仅完成 %d/%d 张: %w", len(items), count, err)
 		}
 		item, err := a.imageDataItem(ctx, credential, imagineImageValue{URL: rawURL}, format)
 		if err != nil {
+			if len(items) == 0 {
+				return nil, err
+			}
+			return nil, fmt.Errorf("Lite 图片仅完成 %d/%d 张: %w", len(items), count, err)
+		}
+		items = append(items, item)
+	}
+	return items, nil
+}
+
+// streamLiteChatImageItems emits already-materialized markdown images. Generation
+// failures must be returned before this starts so clients get HTTP error status.
+func (a *Adapter) streamLiteChatImageItems(ctx context.Context, writer *io.PipeWriter, responseID, model, prompt string, items []map[string]any) {
+	parsed := parsedChat{ResponseID: responseID, InputTokens: estimateTokens(prompt)}
+	writeStreamStart(writer, "chat", responseID, model, parsed.InputTokens)
+	for _, item := range items {
+		if err := ctx.Err(); err != nil {
 			_ = writer.CloseWithError(err)
 			return
 		}
@@ -1039,6 +1110,13 @@ func inspectLiteCapture(data []byte) liteCaptureDiagnostics {
 				result.ErrorMessage = result.ErrorMessage[:200]
 			}
 		}
+		// Prefer model/final text when soft-stop leaves no image payload — helps
+		// distinguish "didn't draw" refusals from parser gaps.
+		if result.ErrorMessage == "" {
+			if message := liteCaptureMessage(response); message != "" {
+				result.ErrorMessage = message
+			}
+		}
 		inspectLiteCaptureValue(response, &result, imageFields)
 		return nil
 	})
@@ -1046,6 +1124,34 @@ func inspectLiteCapture(data []byte) liteCaptureDiagnostics {
 	result.MessageTags = sortedSetValues(tags)
 	result.ImageFields = sortedSetValues(imageFields)
 	return result
+}
+
+func liteCaptureMessage(response map[string]any) string {
+	if response == nil {
+		return ""
+	}
+	if modelResponse, _ := response["modelResponse"].(map[string]any); modelResponse != nil {
+		if message := strings.TrimSpace(firstString(modelResponse, "message", "content", "text")); message != "" {
+			return truncateDiagnosticText(message, 200)
+		}
+	}
+	if finalMeta, _ := response["finalMetadata"].(map[string]any); finalMeta != nil {
+		if message := strings.TrimSpace(firstString(finalMeta, "message", "content", "text", "finishReason", "finish_reason")); message != "" {
+			return truncateDiagnosticText(message, 200)
+		}
+	}
+	if token := strings.TrimSpace(firstString(response, "token")); token != "" && len(token) > 8 {
+		return truncateDiagnosticText(token, 200)
+	}
+	return ""
+}
+
+func truncateDiagnosticText(value string, limit int) string {
+	value = strings.Join(strings.Fields(value), " ")
+	if limit <= 0 || len(value) <= limit {
+		return value
+	}
+	return value[:limit]
 }
 
 func inspectLiteCaptureValue(value any, result *liteCaptureDiagnostics, imageFields map[string]struct{}) {

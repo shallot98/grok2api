@@ -43,6 +43,14 @@ func (r *AdminRepository) GetByID(ctx context.Context, id uint64) (admin.Admin, 
 	return toAdminDomain(row), nil
 }
 
+func (r *AdminRepository) GetFirst(ctx context.Context) (admin.Admin, error) {
+	var row adminModel
+	if err := r.db.db.WithContext(ctx).Order("id ASC").First(&row).Error; err != nil {
+		return admin.Admin{}, mapError(err)
+	}
+	return toAdminDomain(row), nil
+}
+
 func (r *AdminRepository) UpdatePasswordAndRevokeSessions(ctx context.Context, id uint64, passwordHash string) error {
 	return r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		result := tx.Model(&adminModel{}).Where("id = ?", id).Updates(map[string]any{"password_hash": passwordHash, "updated_at": time.Now().UTC()})

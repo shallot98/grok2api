@@ -69,6 +69,12 @@ func (s *Service) rebalanceProvider(ctx context.Context, provider accountdomain.
 	}
 	loads := make(map[uint64]int, len(nodes))
 	byID := make(map[uint64]domain.Node, len(nodes))
+	qualitySuspended := make(map[uint64]bool)
+	for _, node := range allNodes {
+		if !node.Enabled && node.LastError == domain.LastErrorQualityGuardSuspended {
+			qualitySuspended[node.ID] = true
+		}
+	}
 	for _, node := range nodes {
 		loads[node.ID] = node.AssignedAccountCount
 		byID[node.ID] = node
@@ -82,6 +88,9 @@ func (s *Service) rebalanceProvider(ctx context.Context, provider accountdomain.
 		original[credential.ID] = credential.EgressNodeID
 		assignment[credential.ID] = credential.EgressNodeID
 		if !isAutoAssignable(credential, autoAssign, autoBalance) {
+			continue
+		}
+		if qualitySuspended[credential.EgressNodeID] {
 			continue
 		}
 		_, currentHealthy := byID[credential.EgressNodeID]

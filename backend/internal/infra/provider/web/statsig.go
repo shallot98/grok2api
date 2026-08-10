@@ -3,7 +3,10 @@ package web
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -27,6 +30,13 @@ const (
 	statsigCacheMaxEntries  = 4096
 	statsigMetaBodyLimit    = 4 << 20
 	statsigResponseLimit    = 4 << 10
+	// Statsig client SDK uses this salt; Grok web reuses the same construction.
+	statsigHashSalt      = "obfiowerehiring"
+	statsigEpochUnix     = int64(1682924400)
+	statsigMetaByteLen   = 48
+	statsigHashPrefixLen = 16
+	statsigPayloadLen    = 70 // 1 key + 48 meta + 4 ts + 16 hash + 1 trailer
+	statsigTrailerByte   = 3
 )
 
 type statsigCacheEntry struct {
@@ -224,43 +234,124 @@ func statsigSignatureKey(baseURL, signerURL, method, target string) (string, str
 }
 
 func (s *statsigSigner) requestSignature(ctx context.Context, endpoint, method, path, metaContent string) (string, error) {
-	if err := s.validateEndpoint(ctx, endpoint); err != nil {
-		return "", err
+	method = strings.ToUpper(strings.TrimSpace(method))
+	// Prefer the configured remote signer when healthy; fall back to pure local algorithm
+	// so image/chat traffic keeps working when public sign hosts (e.g. wodf.de) are down.
+	if err := s.validateEndpoint(ctx, endpoint); err == nil {
+		payload, _ := json.Marshal(map[string]any{
+			"method": method,
+			"path":   path,
+			"environment": map[string]string{
+				"metaContent": metaContent,
+			},
+		})
+		request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+		if err == nil {
+			request.Header.Set("Content-Type", "application/json")
+			response, doErr := s.client.Do(request)
+			if doErr == nil {
+				body, readErr := io.ReadAll(io.LimitReader(response.Body, statsigResponseLimit+1))
+				_ = response.Body.Close()
+				if readErr == nil && len(body) <= statsigResponseLimit && response.StatusCode >= 200 && response.StatusCode < 300 {
+					var value struct {
+						StatsigID string `json:"x-statsig-id"`
+					}
+					if json.Unmarshal(body, &value) == nil && validStatsigID(value.StatsigID) {
+						return value.StatsigID, nil
+					}
+				}
+			} else {
+				// keep remote error for fallback context
+				_ = doErr
+			}
+		}
 	}
-	payload, _ := json.Marshal(map[string]any{
-		"method": strings.ToUpper(strings.TrimSpace(method)),
-		"path":   path,
-		"environment": map[string]string{
-			"metaContent": metaContent,
-		},
-	})
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	local, localErr := generateLocalStatsigID(method, path, metaContent, s.now().UTC())
+	if localErr != nil {
+		return "", fmt.Errorf("Statsig 签名失败: 远程不可用且本地算法失败: %w", localErr)
+	}
+	return local, nil
+}
+
+// generateLocalStatsigID builds an x-statsig-id without an external signer service.
+// Layout after base64 decode (70 bytes):
+//
+//	[1 XOR key][48 meta][4 LE relative unix][16 sha256 prefix][1 trailer=3]
+//
+// Hash input: "{METHOD}!{path}!{relative}obfiowerehiring"
+func generateLocalStatsigID(method, path, metaContent string, now time.Time) (string, error) {
+	meta, err := decodeStatsigMetaBytes(metaContent)
 	if err != nil {
 		return "", err
 	}
-	request.Header.Set("Content-Type", "application/json")
-	response, err := s.client.Do(request)
-	if err != nil {
+	method = strings.ToUpper(strings.TrimSpace(method))
+	if method == "" {
+		method = http.MethodGet
+	}
+	if path == "" {
+		path = "/"
+	}
+	relative := now.Unix() - statsigEpochUnix
+	if relative < 0 {
+		relative = 0
+	}
+	message := fmt.Sprintf("%s!%s!%d%s", method, path, relative, statsigHashSalt)
+	sum := sha256.Sum256([]byte(message))
+
+	plain := make([]byte, 0, statsigPayloadLen-1)
+	plain = append(plain, meta...)
+	var ts [4]byte
+	binary.LittleEndian.PutUint32(ts[:], uint32(relative))
+	plain = append(plain, ts[:]...)
+	plain = append(plain, sum[:statsigHashPrefixLen]...)
+	plain = append(plain, statsigTrailerByte)
+
+	var keyByte [1]byte
+	if _, err := rand.Read(keyByte[:]); err != nil {
 		return "", err
 	}
-	defer response.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(response.Body, statsigResponseLimit+1))
+	if keyByte[0] == 0 {
+		keyByte[0] = 1
+	}
+	out := make([]byte, statsigPayloadLen)
+	out[0] = keyByte[0]
+	for i, b := range plain {
+		out[i+1] = b ^ keyByte[0]
+	}
+	value := base64.RawStdEncoding.EncodeToString(out)
+	if !validStatsigID(value) {
+		return "", fmt.Errorf("本地签名结果无效")
+	}
+	return value, nil
+}
+
+func decodeStatsigMetaBytes(metaContent string) ([]byte, error) {
+	metaContent = strings.TrimSpace(metaContent)
+	if metaContent == "" {
+		return nil, fmt.Errorf("metaContent 为空")
+	}
+	// grok-site-verification is standard base64 of 48 bytes; tolerate missing padding.
+	raw := metaContent
+	switch len(raw) % 4 {
+	case 2:
+		raw += "=="
+	case 3:
+		raw += "="
+	}
+	decoded, err := base64.StdEncoding.DecodeString(raw)
 	if err != nil {
-		return "", err
+		decoded, err = base64.RawStdEncoding.DecodeString(metaContent)
 	}
-	if len(body) > statsigResponseLimit {
-		return "", fmt.Errorf("签名响应超过安全上限")
+	if err != nil {
+		decoded, err = base64.URLEncoding.DecodeString(raw)
 	}
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return "", fmt.Errorf("签名服务返回 %d", response.StatusCode)
+	if err != nil {
+		return nil, fmt.Errorf("解码 metaContent: %w", err)
 	}
-	var value struct {
-		StatsigID string `json:"x-statsig-id"`
+	if len(decoded) != statsigMetaByteLen {
+		return nil, fmt.Errorf("metaContent 长度无效: %d", len(decoded))
 	}
-	if json.Unmarshal(body, &value) != nil || !validStatsigID(value.StatsigID) {
-		return "", fmt.Errorf("签名服务响应无效")
-	}
-	return value.StatsigID, nil
+	return decoded, nil
 }
 
 func validateStatsigSignerEndpoint(ctx context.Context, endpoint string) error {

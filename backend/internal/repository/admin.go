@@ -13,6 +13,8 @@ type AdminRepository interface {
 	Create(ctx context.Context, value admin.Admin) (admin.Admin, error)
 	GetByUsername(ctx context.Context, username string) (admin.Admin, error)
 	GetByID(ctx context.Context, id uint64) (admin.Admin, error)
+	// GetFirst 返回创建时间最早的管理员，用于单管理员场景下的免密会话签发。
+	GetFirst(ctx context.Context) (admin.Admin, error)
 	UpdatePasswordAndRevokeSessions(ctx context.Context, id uint64, passwordHash string) error
 }
 

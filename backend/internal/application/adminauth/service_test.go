@@ -93,6 +93,46 @@ func TestLoginRateLimiterFailureIsEnforced(t *testing.T) {
 	}
 }
 
+func TestLoginByTrustedIP(t *testing.T) {
+	database, err := relational.OpenSQLite(context.Background(), filepath.Join(t.TempDir(), "auth.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(relational.NewAdminRepository(database), relational.NewAdminSessionRepository(database), security.NewTokenService("12345678901234567890123456789012"), time.Minute, time.Hour)
+	service.SetTrustedLoginIPs([]string{"23.82.96.72", "159.138.123.16", "154.16.10.183"})
+	ctx := context.Background()
+	if err := service.Bootstrap(ctx, "admin", "password123"); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := service.LoginByTrustedIP(ctx, "1.2.3.4"); !errors.Is(err, ErrTrustedLoginDenied) {
+		t.Fatalf("untrusted IP error = %v", err)
+	}
+
+	adminValue, tokens, err := service.LoginByTrustedIP(ctx, "159.138.123.16")
+	if err != nil {
+		t.Fatalf("trusted login failed: %v", err)
+	}
+	if adminValue.Username != "admin" {
+		t.Fatalf("admin = %#v", adminValue)
+	}
+	if tokens.AccessToken == "" || tokens.RefreshToken == "" {
+		t.Fatalf("tokens incomplete: %#v", tokens)
+	}
+	if _, err := service.AuthenticateAccess(ctx, tokens.AccessToken); err != nil {
+		t.Fatalf("access token invalid: %v", err)
+	}
+
+	// IPv4-mapped form should still match.
+	if _, _, err := service.LoginByTrustedIP(ctx, "::ffff:23.82.96.72"); err != nil {
+		t.Fatalf("mapped IPv4 trusted login failed: %v", err)
+	}
+}
+
 func TestLoginDistinguishesPersistenceFailure(t *testing.T) {
 	service := NewService(failingAdminRepository{}, nil, security.NewTokenService("12345678901234567890123456789012"), time.Minute, time.Hour)
 	if _, _, err := service.Login(context.Background(), "admin", "password123", "127.0.0.1"); !errors.Is(err, ErrRuntimeUnavailable) {

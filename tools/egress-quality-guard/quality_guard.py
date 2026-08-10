@@ -23,6 +23,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -76,6 +77,8 @@ class Config:
     rotation_token: str
     rotation_timeout_seconds: int
     rotatable_node_ids: tuple[str, ...]
+    active_concurrency: int
+    max_rotation_attempts: int
     prompt: str
     expected: str
     state_file: Path
@@ -127,6 +130,8 @@ class Config:
             rotation_token=str(values.get("rotation_token") or ""),
             rotation_timeout_seconds=int(values.get("rotation_timeout_seconds") or 0),
             rotatable_node_ids=rotatable_node_ids,
+            active_concurrency=int(os.getenv("QG_ACTIVE_CONCURRENCY", "4")),
+            max_rotation_attempts=int(os.getenv("QG_MAX_ROTATION_ATTEMPTS", "3")),
             prompt=str(values.get("prompt") or "").strip(),
             expected=str(values.get("expected") or "").strip(),
             state_file=Path("/var/lib/grok2api-quality-guard/state.json"),
@@ -172,6 +177,10 @@ class Config:
             raise ValueError("qualityGuard.rotationURL is required when rotatableNodeIDs are configured")
         if any(not value.isdigit() or int(value) < 1 for value in self.rotatable_node_ids):
             raise ValueError("qualityGuard.rotatableNodeIDs must contain positive integers")
+        if self.active_concurrency < 1 or self.active_concurrency > 16:
+            raise ValueError("QG_ACTIVE_CONCURRENCY must be between 1 and 16")
+        if self.max_rotation_attempts < 1 or self.max_rotation_attempts > 5:
+            raise ValueError("QG_MAX_ROTATION_ATTEMPTS must be between 1 and 5")
         if self.passive_page_size > 2000:
             raise ValueError("internal passive page size must not exceed 2000")
 
@@ -302,8 +311,11 @@ class ApiClient:
                 result.add(node_id)
         return result
 
-    def quality_test(self, node_id: str) -> dict[str, Any]:
-        return self._request("POST", f"{INTERNAL_API_PREFIX}/egress-nodes/{node_id}/quality-test")
+    def quality_test(self, node_id: str, account_id: str = "") -> dict[str, Any]:
+        path = f"{INTERNAL_API_PREFIX}/egress-nodes/{node_id}/quality-test"
+        if account_id:
+            path += "?" + urllib.parse.urlencode({"accountId": account_id})
+        return self._request("POST", path)
 
     def connectivity_test(self, node_id: str) -> dict[str, Any]:
         return self._request("POST", f"{INTERNAL_API_PREFIX}/egress-nodes/{node_id}/test")
@@ -318,9 +330,22 @@ class ApiClient:
             query["cursor"] = cursor
         return self._request("GET", f"{INTERNAL_API_PREFIX}/request-audits?{urllib.parse.urlencode(query)}")
 
-    def set_enabled(self, node_id: str, enabled: bool) -> int:
-        result = self._request("PATCH", f"{INTERNAL_API_PREFIX}/egress-nodes/batch", {"ids": [node_id], "enabled": enabled})
-        return int(result.get("updated") or 0)
+    def set_suspended(self, node_id: str, suspended: bool) -> bool:
+        result = self._request(
+            "PUT",
+            f"{INTERNAL_API_PREFIX}/egress-nodes/{node_id}/quality-suspension",
+            {"suspended": suspended},
+        )
+        return bool(result.get("changed"))
+
+    def quarantine_account(self, account_id: str) -> None:
+        if not account_id:
+            raise RuntimeError("quality account ID is missing")
+        self._request(
+            "POST",
+            f"{INTERNAL_API_PREFIX}/egress-quality-accounts/{account_id}/quarantine",
+            {"model": self.config.model},
+        )
 
     def rotate_node(self, node_id: str, old_exit_ip: str = "") -> dict[str, Any]:
         if not self.config.rotation_url:
@@ -353,11 +378,11 @@ class ApiClient:
 def classify_result(result: dict[str, Any], config: Config) -> tuple[str, str]:
     if not bool(result.get("expectedMatched")):
         return "soft", "expected_marker_missing"
-    output_tokens = int(result.get("outputTokens") or result.get("visibleTokens") or 0)
-    speed_value = result.get("outputTokensPerSecond")
+    output_tokens = int(result.get("outputTokens") or 0)
+    speed_value = result.get("visibleTokensPerSecond")
     if speed_value is None:
-        # Rolling upgrades may still expose panel-equivalent TPS under the legacy name.
-        speed_value = result.get("visibleTokensPerSecond")
+        # Rolling upgrades may still expose only the legacy total-token rate.
+        speed_value = result.get("outputTokensPerSecond")
     speed = float(speed_value or 0.0)
     generation_ms = int(result.get("generationMs") or 0)
     if generation_ms <= 0:
@@ -384,9 +409,11 @@ def classify_audit(value: dict[str, Any], config: Config) -> tuple[str, str, flo
         return "ignored", "missing_first_token", 0.0, 0
     generation_ms = int(value.get("durationMs") or 0) - int(first_token_ms)
     output_tokens = max(0, int(value.get("outputTokens") or 0))
+    reasoning_tokens = max(0, int(value.get("reasoningTokens") or 0))
+    visible_tokens = max(0, output_tokens - reasoning_tokens)
     if generation_ms <= 0 or output_tokens < 32:
         return "ignored", "insufficient_output_tokens", 0.0, output_tokens
-    speed = float(output_tokens) * 1000 / float(generation_ms)
+    speed = float(visible_tokens) * 1000 / float(generation_ms)
     if config.fail_closed and generation_ms < config.min_generation_ms and speed >= config.soft_tps:
         return "hard", "buffered_burst", speed, output_tokens
     if speed >= config.hard_tps:
@@ -415,6 +442,8 @@ def default_node_state() -> dict[str, Any]:
         "last_rotation_at": 0.0,
         "last_rotation_exit_ip": "",
         "rotation_failures": 0,
+        "affected_account_id": "",
+        "last_attribution": "",
         "last_no_account_log_at": 0.0,
     }
 
@@ -536,6 +565,8 @@ class Guard:
             "fail_closed": self.config.fail_closed,
             "min_generation_ms": self.config.min_generation_ms,
             "rotatable_node_ids": list(self.config.rotatable_node_ids),
+            "active_concurrency": self.config.active_concurrency,
+            "max_rotation_attempts": self.config.max_rotation_attempts,
             "prompt": self.config.prompt,
             "expected": self.config.expected,
         }
@@ -610,7 +641,26 @@ class Guard:
     def _probe_account_unavailable(exc: Exception) -> bool:
         return isinstance(exc, ApiError) and exc.code == "egressQualityProbeNoAccount"
 
-    def _quarantine(self, nodes: list[dict[str, Any]], node: dict[str, Any], reason: str, now: float) -> None:
+    def _restore_suspended(self, node_id: str) -> bool:
+        try:
+            return self.api.set_suspended(node_id, False)
+        except ApiError as exc:
+            if exc.status != 400 or exc.code != "invalidEgressNode":
+                raise
+        # A successful recovery request may have cleared the persisted health
+        # reason on older backends. Reassert guard ownership before restoring.
+        if not self.api.set_suspended(node_id, True):
+            raise RuntimeError("quality suspension ownership could not be repaired")
+        return self.api.set_suspended(node_id, False)
+
+    def _quarantine(
+        self,
+        nodes: list[dict[str, Any]],
+        node: dict[str, Any],
+        reason: str,
+        now: float,
+        account_id: str = "",
+    ) -> None:
         node_id = str(node["id"])
         state = self._state_for(node_id)
         if not self._can_quarantine(nodes, node_id):
@@ -625,23 +675,25 @@ class Guard:
             "quarantined_until": now + self.config.quarantine_seconds,
             "disabled_by_guard": True,
             "last_reason": reason,
+            "affected_account_id": account_id,
+            "last_attribution": "",
         })
         # Persist ownership before changing backend scheduling state. A crash
         # after the API call can then be reconciled safely on restart.
         self._save()
         try:
-            updated = self.api.set_enabled(node_id, False)
+            changed = self.api.set_suspended(node_id, True)
         except Exception as exc:
             state.clear()
             state.update(previous_state)
             self._save()
             log_event("quarantine_failed", node_id=node_id, node_name=node.get("name"), reason=reason, error_type=type(exc).__name__)
             return
-        if updated != 1:
+        if not changed:
             state.clear()
             state.update(previous_state)
             self._save()
-            log_event("quarantine_not_applied", node_id=node_id, node_name=node.get("name"), reason=reason, updated=updated)
+            log_event("quarantine_not_applied", node_id=node_id, node_name=node.get("name"), reason=reason)
             return
         node["enabled"] = False
         self._bump_statistic("actions", "quarantined")
@@ -656,10 +708,10 @@ class Guard:
     def _record_probe(self, node: dict[str, Any], result: dict[str, Any], classification: str, reason: str, now: float) -> None:
         node_id = str(node["id"])
         state = self._state_for(node_id)
-        output_tokens = int(result.get("outputTokens") or result.get("visibleTokens") or 0)
-        output_tps_value = result.get("outputTokensPerSecond")
+        output_tokens = int(result.get("outputTokens") or 0)
+        output_tps_value = result.get("visibleTokensPerSecond")
         if output_tps_value is None:
-            output_tps_value = result.get("visibleTokensPerSecond")
+            output_tps_value = result.get("outputTokensPerSecond")
         output_tps = float(output_tps_value or 0.0)
         state["last_probe_at"] = now
         state.update({
@@ -693,17 +745,25 @@ class Guard:
             duration_ms=int(result.get("durationMs") or 0),
             chunk_count=int(result.get("chunkCount") or 0),
             expected_matched=bool(result.get("expectedMatched")),
+            account_id=result.get("accountId"),
         )
 
-    def _probe_active(self, nodes: list[dict[str, Any]], node: dict[str, Any], now: float, trigger: str = "scheduled") -> None:
+    def _apply_active_probe(
+        self,
+        nodes: list[dict[str, Any]],
+        node: dict[str, Any],
+        now: float,
+        trigger: str,
+        outcome: dict[str, Any] | Exception,
+        account_id: str = "",
+    ) -> None:
         node_id = str(node["id"])
         state = self._state_for(node_id)
         if state.get("last_reason") == "probe_no_account" and now < float(state.get("quarantined_until", 0.0)):
             return
         self._bump_statistic("active", "total")
-        try:
-            result = self.api.quality_test(node_id)
-        except Exception as exc:
+        if isinstance(outcome, Exception):
+            exc = outcome
             if self._probe_account_unavailable(exc):
                 self._defer_no_account(state, node, now, "quality_probe_deferred", trigger=trigger)
                 return
@@ -714,12 +774,33 @@ class Guard:
             if trigger == "scheduled" and state["error_strikes"] >= self.config.consecutive_errors:
                 self._quarantine(nodes, node, "probe_errors", now)
             return
+        result = outcome
+        account_id = str(result.get("accountId") or account_id)
+        if account_id == "0":
+            account_id = ""
         classification, reason = classify_result(result, self.config)
         self._record_probe(node, result, classification, reason, now)
         if classification == "hard" or (
             classification == "soft" and self.config.fail_closed
         ) or int(state.get("active_soft_strikes", 0)) >= self.config.consecutive_soft:
-            self._quarantine(nodes, node, reason, now)
+            self._quarantine(nodes, node, reason, now, account_id)
+
+    def _probe_active(
+        self,
+        nodes: list[dict[str, Any]],
+        node: dict[str, Any],
+        now: float,
+        trigger: str = "scheduled",
+        account_id: str = "",
+    ) -> None:
+        state = self._state_for(str(node["id"]))
+        if state.get("last_reason") == "probe_no_account" and now < float(state.get("quarantined_until", 0.0)):
+            return
+        try:
+            outcome: dict[str, Any] | Exception = self.api.quality_test(str(node["id"]), account_id)
+        except Exception as exc:  # noqa: BLE001 - active probe boundary
+            outcome = exc
+        self._apply_active_probe(nodes, node, now, trigger, outcome, account_id)
 
     def _recover_quarantined(
         self,
@@ -730,71 +811,177 @@ class Guard:
     ) -> None:
         node_id = str(node["id"])
         state = self._state_for(node_id)
-        if rotate:
+        started_at = time.monotonic()
+        max_attempts = self.config.max_rotation_attempts if rotate else 1
+        connectivity_status = "unknown"
+        last_reason = str(state.get("last_reason") or "recovery_failed")
+        affected_account_id = str(state.get("affected_account_id") or "")
+        for attempt in range(1, max_attempts + 1):
+            if rotate:
+                try:
+                    rotation = self.api.rotate_node(node_id, str(node.get("exitIp") or ""))
+                except Exception as exc:
+                    state["rotation_failures"] = int(state.get("rotation_failures", 0)) + 1
+                    state["last_reason"] = "rotation_error"
+                    last_reason = "rotation_error"
+                    log_event(
+                        "node_rotation_failed",
+                        node_id=node_id,
+                        node_name=node.get("name"),
+                        attempt=attempt,
+                        max_attempts=max_attempts,
+                        error_type=type(exc).__name__,
+                    )
+                    self._save()
+                    continue
+                new_exit_ip = str(rotation.get("newExitIp") or "")
+                node["exitIp"] = new_exit_ip
+                state.update({
+                    "last_rotation_at": time.time(),
+                    "last_rotation_exit_ip": new_exit_ip,
+                    "rotation_failures": 0,
+                })
+                append_state_event(
+                    self.state,
+                    "node_rotated",
+                    node_id=node_id,
+                    node_name=node.get("name"),
+                    exit_ip=new_exit_ip,
+                    attempt=attempt,
+                )
+                log_event(
+                    "node_rotated",
+                    node_id=node_id,
+                    node_name=node.get("name"),
+                    exit_ip=new_exit_ip,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                )
             try:
-                rotation = self.api.rotate_node(node_id, str(node.get("exitIp") or ""))
+                try:
+                    connectivity = self.api.connectivity_test(node_id)
+                    connectivity_status = str(connectivity.get("status") or "unknown")
+                except Exception as exc:
+                    connectivity_status = "error"
+                    log_event("recovery_connectivity_probe_failed", node_id=node_id, node_name=node.get("name"), attempt=attempt, error_type=type(exc).__name__)
+                self._bump_statistic("active", "total")
+                result = self.api.quality_test(node_id, affected_account_id)
+                classification, reason = classify_result(result, self.config)
+                self._record_probe(node, result, classification, reason, time.time())
             except Exception as exc:
-                state["rotation_failures"] = int(state.get("rotation_failures", 0)) + 1
-                state["quarantined_until"] = now + self.config.quarantine_seconds
-                state["last_reason"] = "rotation_error"
-                log_event("node_rotation_failed", node_id=node_id, node_name=node.get("name"), error_type=type(exc).__name__)
+                if self._probe_account_unavailable(exc):
+                    probe_now = now if attempt == 1 else time.time()
+                    self._defer_no_account(state, node, probe_now, "recovery_probe_deferred")
+                    self._save()
+                    return
+                self._bump_statistic("active", "errors")
+                state["last_reason"] = "recovery_probe_error"
+                last_reason = "recovery_probe_error"
+                log_event("recovery_probe_failed", node_id=node_id, node_name=node.get("name"), attempt=attempt, error_type=type(exc).__name__)
+                self._save()
+                continue
+            if classification == "healthy":
+                state["last_attribution"] = "ip" if affected_account_id else "node"
+                changed = self._restore_suspended(node_id)
+                if not changed:
+                    log_event("restore_not_applied", node_id=node_id, node_name=node.get("name"))
+                    return
+                state.update({
+                    "active_soft_strikes": 0,
+                    "passive_soft_strikes": 0,
+                    "error_strikes": 0,
+                    "quarantined_until": 0.0,
+                    "disabled_by_guard": False,
+                    "last_reason": "",
+                })
+                node["enabled"] = True
+                self._bump_statistic("actions", "restored")
+                append_state_event(self.state, "node_restored", node_id=node_id, node_name=node.get("name"), reason="quality_probe_healthy")
+                log_event(
+                    "node_restored",
+                    node_id=node_id,
+                    node_name=node.get("name"),
+                    connectivity_status=connectivity_status,
+                    attempt=attempt,
+                    recovery_ms=round((time.monotonic() - started_at) * 1000),
+                )
+                self._save()
                 return
-            state.update({
-                "last_rotation_at": time.time(),
-                "last_rotation_exit_ip": str(rotation.get("newExitIp") or ""),
-                "rotation_failures": 0,
-            })
-            append_state_event(
-                self.state,
-                "node_rotated",
-                node_id=node_id,
-                node_name=node.get("name"),
-                exit_ip=str(rotation.get("newExitIp") or ""),
-            )
-            log_event("node_rotated", node_id=node_id, node_name=node.get("name"), exit_ip=str(rotation.get("newExitIp") or ""))
-        try:
-            try:
-                connectivity = self.api.connectivity_test(node_id)
-                connectivity_status = str(connectivity.get("status") or "unknown")
-            except Exception as exc:
-                connectivity_status = "error"
-                log_event("recovery_connectivity_probe_failed", node_id=node_id, node_name=node.get("name"), error_type=type(exc).__name__)
-            self._bump_statistic("active", "total")
-            result = self.api.quality_test(node_id)
-            classification, reason = classify_result(result, self.config)
-            self._record_probe(node, result, classification, reason, now)
-        except Exception as exc:
-            if self._probe_account_unavailable(exc):
-                self._defer_no_account(state, node, now, "recovery_probe_deferred")
-                return
-            self._bump_statistic("active", "errors")
-            state["quarantined_until"] = now + self.config.quarantine_seconds
-            state["last_reason"] = "recovery_probe_error"
-            log_event("recovery_probe_failed", node_id=node_id, node_name=node.get("name"), error_type=type(exc).__name__)
-            return
-        if classification != "healthy":
-            state["quarantined_until"] = now + self.config.quarantine_seconds
+            if affected_account_id:
+                try:
+                    self.api.quarantine_account(affected_account_id)
+                    sentinel = self.api.quality_test(node_id)
+                    sentinel_classification, sentinel_reason = classify_result(sentinel, self.config)
+                    self._record_probe(node, sentinel, sentinel_classification, sentinel_reason, time.time())
+                except Exception as exc:
+                    last_reason = "account_attribution_error"
+                    state["last_reason"] = last_reason
+                    log_event(
+                        "account_attribution_failed",
+                        node_id=node_id,
+                        node_name=node.get("name"),
+                        account_id=affected_account_id,
+                        attempt=attempt,
+                        error_type=type(exc).__name__,
+                    )
+                    self._save()
+                    break
+                if sentinel_classification == "healthy":
+                    state["last_attribution"] = "account"
+                    state["last_reason"] = "account_quality_degraded"
+                    changed = self._restore_suspended(node_id)
+                    if not changed:
+                        log_event("restore_not_applied", node_id=node_id, node_name=node.get("name"))
+                        return
+                    state.update({
+                        "active_soft_strikes": 0,
+                        "passive_soft_strikes": 0,
+                        "error_strikes": 0,
+                        "quarantined_until": 0.0,
+                        "disabled_by_guard": False,
+                    })
+                    node["enabled"] = True
+                    self._bump_statistic("actions", "restored")
+                    append_state_event(
+                        self.state,
+                        "account_quality_quarantined",
+                        node_id=node_id,
+                        node_name=node.get("name"),
+                        account_id=affected_account_id,
+                    )
+                    log_event(
+                        "node_restored_after_account_attribution",
+                        node_id=node_id,
+                        node_name=node.get("name"),
+                        account_id=affected_account_id,
+                        attempt=attempt,
+                        recovery_ms=round((time.monotonic() - started_at) * 1000),
+                    )
+                    self._save()
+                    return
+                reason = sentinel_reason
+            last_reason = reason
             state["last_reason"] = reason
-            log_event("quarantine_extended", node_id=node_id, node_name=node.get("name"), reason=reason)
-            if rotate_on_failure and self._should_rotate(node_id, reason):
-                self._recover_quarantined(node, time.time(), rotate=True)
+            log_event("replacement_probe_rejected", node_id=node_id, node_name=node.get("name"), reason=reason, attempt=attempt)
+            self._save()
+            if not rotate:
+                break
+
+        if not rotate and rotate_on_failure and self._should_rotate(node_id, last_reason):
+            self._recover_quarantined(node, time.time(), rotate=True)
             return
-        updated = self.api.set_enabled(node_id, True)
-        if updated != 1:
-            log_event("restore_not_applied", node_id=node_id, node_name=node.get("name"), updated=updated)
-            return
-        state.update({
-            "active_soft_strikes": 0,
-            "passive_soft_strikes": 0,
-            "error_strikes": 0,
-            "quarantined_until": 0.0,
-            "disabled_by_guard": False,
-            "last_reason": "",
-        })
-        node["enabled"] = True
-        self._bump_statistic("actions", "restored")
-        append_state_event(self.state, "node_restored", node_id=node_id, node_name=node.get("name"), reason="quality_probe_healthy")
-        log_event("node_restored", node_id=node_id, node_name=node.get("name"), connectivity_status=connectivity_status)
+        state["quarantined_until"] = time.time() + self.config.quarantine_seconds
+        state["last_reason"] = last_reason
+        event = "replacement_candidates_exhausted" if rotate else "quarantine_extended"
+        log_event(
+            event,
+            node_id=node_id,
+            node_name=node.get("name"),
+            reason=last_reason,
+            attempts=max_attempts,
+            recovery_ms=round((time.monotonic() - started_at) * 1000),
+        )
+        self._save()
 
     def _probe_quarantined(self, node: dict[str, Any], now: float) -> None:
         node_id = str(node["id"])
@@ -857,8 +1044,8 @@ class Guard:
             state = self._state_for(node_id)
             if state.get("disabled_by_guard") and node.get("enabled"):
                 if self.config.fail_closed:
-                    updated = self.api.set_enabled(node_id, False)
-                    if updated == 1:
+                    changed = self.api.set_suspended(node_id, True)
+                    if changed:
                         node["enabled"] = False
                         state["quarantined_until"] = now + self.config.quarantine_seconds
                         log_event("operator_reenable_requires_probe", node_id=node_id, node_name=node.get("name"))
@@ -890,12 +1077,28 @@ class Guard:
     def run_active_cycle(self) -> None:
         now = time.time()
         all_nodes, nodes, skip_ids = self._prepare_nodes(now)
+        scheduled: list[dict[str, Any]] = []
         for node in nodes:
             node_id = str(node["id"])
             state = self._state_for(node_id)
             if node_id not in skip_ids and node.get("enabled") and not state.get("disabled_by_guard"):
-                self._probe_active(all_nodes, node, now)
-            self._save()
+                if state.get("last_reason") == "probe_no_account" and now < float(state.get("quarantined_until", 0.0)):
+                    continue
+                scheduled.append(node)
+
+        futures: dict[Future[dict[str, Any]], dict[str, Any]] = {}
+        with ThreadPoolExecutor(max_workers=self.config.active_concurrency) as executor:
+            for node in scheduled:
+                futures[executor.submit(self.api.quality_test, str(node["id"]))] = node
+            for future in as_completed(futures):
+                node = futures[future]
+                try:
+                    outcome: dict[str, Any] | Exception = future.result()
+                except Exception as exc:  # noqa: BLE001 - concurrent probe boundary
+                    outcome = exc
+                self._apply_active_probe(all_nodes, node, now, "scheduled", outcome)
+                self._save()
+
         self.state["last_active_cycle_at"] = time.time()
         self._save()
 
@@ -990,14 +1193,21 @@ class Guard:
             first_token_ms=int(audit_value.get("firstTokenMs") or 0),
             duration_ms=int(audit_value.get("durationMs") or 0),
             strikes=int(state.get("passive_soft_strikes", 0)),
+            account_id=audit_value.get("accountId"),
         )
-        if classification == "hard":
-            self._quarantine(all_nodes, node, reason, now)
-            return
-        if self.config.fail_closed:
-            self._quarantine(all_nodes, node, reason, now)
-            return
-        self._probe_active(all_nodes, node, now, trigger="passive_confirmation")
+        # Passive traffic identifies suspects but never mutates routing. The
+        # active model probe owns the quarantine decision for every severity.
+        self._probe_active(
+            all_nodes,
+            node,
+            now,
+            trigger="passive_confirmation",
+            account_id=(
+                ""
+                if str(audit_value.get("accountId") or "") == "0"
+                else str(audit_value.get("accountId") or "")
+            ),
+        )
 
     def run_passive_cycle(self) -> None:
         now = time.time()

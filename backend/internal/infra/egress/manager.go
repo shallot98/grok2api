@@ -832,6 +832,9 @@ func (m *Manager) acquire(ctx context.Context, scope domain.Scope, affinity stri
 				return m.acquireUnavailableFallback(ctx, scope, affinity, allowDirect, encryptedCredentialCookies, managedClearance, fmt.Errorf("绑定出口节点 %d 与 %s 作用域不兼容", boundNodeID, scope))
 			}
 			if !selected.Enabled && !qualityProbe {
+				if selected.LastError == domain.LastErrorQualityGuardSuspended {
+					return nil, true, fmt.Errorf("绑定出口节点 %d 已被质量守护暂停", boundNodeID)
+				}
 				return m.acquireUnavailableFallback(ctx, scope, affinity, allowDirect, encryptedCredentialCookies, managedClearance, fmt.Errorf("绑定出口节点 %d 已禁用", boundNodeID))
 			}
 			if strings.TrimSpace(selected.EncryptedProxyURL) == "" {
@@ -1678,9 +1681,10 @@ func (m *Manager) FeedbackForScope(ctx context.Context, scope domain.Scope, node
 		// Build 403 may indicate account permissions, quota, token, or egress policy. The gateway classifies the body;
 		// status alone must not misclassify standard CLI egress as Web anti-bot behavior.
 		return
-	case scope == domain.ScopeBuild && status == http.StatusBadRequest:
-		// Device OAuth polls with 400 + authorization_pending before user confirmation.
-		// This is a normal protocol state and must not cool the egress node.
+	case status == http.StatusBadRequest:
+		// OAuth device/token exchanges commonly return 400 (authorization_pending, access_denied).
+		// Treat as application-level result, not egress transport failure.
+
 		return
 	case status == http.StatusForbidden:
 		if m.isProxyPoolNode(value) {

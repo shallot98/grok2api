@@ -42,6 +42,7 @@ type Dependencies struct {
 	MaxBodyBytes       int64
 	ConcurrencyGate    *middleware.ConcurrencyGate
 	SecureCookies      bool
+	TrustedProxies     []string
 	SwaggerEnabled     bool
 	PublicAPIBaseURL   string
 	FrontendStaticPath string
@@ -115,6 +116,14 @@ func New(deps Dependencies) *gin.Engine {
 		deps.Logger = slog.Default()
 	}
 	router := gin.New()
+	if len(deps.TrustedProxies) > 0 {
+		if err := router.SetTrustedProxies(deps.TrustedProxies); err != nil {
+			panic("httpserver: 设置 TrustedProxies 失败: " + err.Error())
+		}
+	} else {
+		// 默认不信任任何代理头，避免伪造 X-Forwarded-For 绕过 IP 白名单。
+		_ = router.SetTrustedProxies(nil)
+	}
 	router.Use(gin.Recovery(), middleware.RequestID(), middleware.SecurityHeaders(), middleware.MaxBodyBytes(deps.MaxBodyBytes), middleware.Timeout(deps.RequestTimeout), middleware.AccessLog(deps.Logger))
 	router.GET("/healthz", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"ok": true}) })
 	router.GET("/readyz", func(c *gin.Context) {
@@ -141,6 +150,7 @@ func New(deps Dependencies) *gin.Engine {
 
 	adminRoot := router.Group("/api/admin/v1")
 	authHandler := adminauthhttp.NewHandler(deps.AdminAuth, deps.SecureCookies)
+	authHandler.SetTrustProxyHeaders(len(deps.TrustedProxies) > 0)
 	authHandler.RegisterPublic(adminRoot)
 	adminProtected := adminRoot.Group("")
 	adminProtected.Use(middleware.AdminAuth(deps.AdminAuth))

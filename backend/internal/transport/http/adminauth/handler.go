@@ -20,14 +20,22 @@ const refreshCookieName = "grok2api_admin_refresh"
 type Handler struct {
 	service       *adminapp.Service
 	secureCookies bool
+	// trustProxyHeaders 为 true 时使用 gin ClientIP（依赖引擎上的 TrustedProxies）。
+	trustProxyHeaders bool
 }
 
 func NewHandler(service *adminapp.Service, secureCookies bool) *Handler {
 	return &Handler{service: service, secureCookies: secureCookies}
 }
 
+// SetTrustProxyHeaders 控制是否从受信代理头解析客户端 IP（用于免密登录白名单）。
+func (h *Handler) SetTrustProxyHeaders(enabled bool) {
+	h.trustProxyHeaders = enabled
+}
+
 func (h *Handler) RegisterPublic(router *gin.RouterGroup) {
 	router.POST("/auth/login", h.login)
+	router.POST("/auth/trusted-login", h.trustedLogin)
 	router.POST("/auth/refresh", h.refresh)
 	router.POST("/auth/logout", h.logout)
 }
@@ -68,7 +76,7 @@ func (h *Handler) login(c *gin.Context) {
 		response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
 		return
 	}
-	adminValue, tokens, err := h.service.Login(c.Request.Context(), request.Username, request.Password, remoteAddress(c.Request))
+	adminValue, tokens, err := h.service.Login(c.Request.Context(), request.Username, request.Password, h.clientIP(c))
 	if err != nil {
 		if errors.Is(err, adminapp.ErrLoginRateLimited) {
 			response.Error(c, http.StatusTooManyRequests, "loginRateLimited", "登录尝试过于频繁，请稍后重试")
@@ -83,6 +91,37 @@ func (h *Handler) login(c *gin.Context) {
 	}
 	h.setRefreshCookie(c, tokens)
 	response.Success(c, http.StatusOK, gin.H{"admin": newAdminResponse(adminValue), "tokens": newTokenResponse(tokens)})
+}
+
+func (h *Handler) trustedLogin(c *gin.Context) {
+	adminValue, tokens, err := h.service.LoginByTrustedIP(c.Request.Context(), h.clientIP(c))
+	if err != nil {
+		if errors.Is(err, adminapp.ErrLoginRateLimited) {
+			response.Error(c, http.StatusTooManyRequests, "loginRateLimited", "登录尝试过于频繁，请稍后重试")
+			return
+		}
+		if errors.Is(err, adminapp.ErrRuntimeUnavailable) {
+			response.Error(c, http.StatusServiceUnavailable, "authRuntimeUnavailable", "管理员认证服务暂不可用")
+			return
+		}
+		if errors.Is(err, adminapp.ErrTrustedLoginNoAdmin) {
+			response.Error(c, http.StatusServiceUnavailable, "adminNotReady", "管理员账号尚未初始化")
+			return
+		}
+		response.Error(c, http.StatusUnauthorized, "trustedLoginDenied", "当前 IP 不允许免密登录")
+		return
+	}
+	h.setRefreshCookie(c, tokens)
+	response.Success(c, http.StatusOK, gin.H{"admin": newAdminResponse(adminValue), "tokens": newTokenResponse(tokens)})
+}
+
+func (h *Handler) clientIP(c *gin.Context) string {
+	if h.trustProxyHeaders {
+		if ip := strings.TrimSpace(c.ClientIP()); ip != "" {
+			return ip
+		}
+	}
+	return remoteAddress(c.Request)
 }
 
 func remoteAddress(request *http.Request) string {

@@ -9,6 +9,7 @@ import (
 	"time"
 	"unicode"
 
+	modeldomain "github.com/chenyme/grok2api/backend/internal/domain/model"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	neterrorpkg "github.com/chenyme/grok2api/backend/internal/pkg/neterror"
 )
@@ -67,7 +68,11 @@ func (e *UpstreamFailure) AuditCode() string {
 	if e == nil {
 		return "upstream_error"
 	}
-	if suffix := normalizeFailureCode(e.UpstreamCode); suffix != "" {
+	suffix := normalizeFailureCode(e.UpstreamCode)
+	base := normalizeFailureCode(e.Code)
+	// Avoid doubled codes when gateway Code already mirrors the upstream machine code
+	// (e.g. image_generation_empty + image_generation_empty).
+	if suffix != "" && suffix != base {
 		return truncateFailureCode(e.Code + "_" + suffix)
 	}
 	return truncateFailureCode(e.Code)
@@ -166,6 +171,16 @@ func newHTTPUpstreamFailure(status int, body []byte, accountID uint64, accountNa
 		failure.Code = "upstream_server_error"
 		failure.PublicMessage = "上游服务暂时异常"
 	}
+	// Lite Imagine soft-stop / empty payloads are account+model specific and should rotate.
+	if isImageGenerationEmpty(metadataText) {
+		failure.Code = "image_generation_empty"
+		failure.PublicMessage = "上游未返回图片，请稍后重试"
+		failure.AccountScoped = true
+		failure.ModelQuotaExhausted = true
+		if failure.HTTPStatus < 400 {
+			failure.HTTPStatus = http.StatusBadGateway
+		}
+	}
 	fingerprintPart := normalizeFailureCode(firstNonEmptyFailure(upstreamCode, upstreamType, upstreamMessage))
 	if fingerprintPart == "" {
 		fingerprintPart = "unknown"
@@ -183,6 +198,18 @@ func newTransportUpstreamFailure(err error, accountID uint64, accountName string
 		status, code, message = http.StatusGatewayTimeout, "upstream_stream_idle_timeout", "上游流式响应长时间无数据"
 	} else if errors.Is(err, context.DeadlineExceeded) {
 		code, message = "upstream_timeout", "上游服务响应超时"
+	}
+	errText := ""
+	if err != nil {
+		errText = strings.ToLower(err.Error())
+	}
+	// Upstream sometimes ends Lite image streams with a render failure instead of a JSON error.
+	if isImageGenerationEmpty(errText) || strings.Contains(errText, "couldn't be rendered") || strings.Contains(errText, "could not be rendered") {
+		return &UpstreamFailure{
+			HTTPStatus: http.StatusBadGateway, Code: "image_generation_empty", PublicMessage: "上游未返回图片，请稍后重试",
+			UpstreamCode: "image_generation_empty", AccountID: accountID, AccountName: accountName,
+			AccountScoped: true, ModelQuotaExhausted: true, Fingerprint: "502:image_generation_empty", Cause: err,
+		}
 	}
 	return &UpstreamFailure{
 		HTTPStatus: status, Code: code, PublicMessage: message,
@@ -270,7 +297,24 @@ func isFreeQuotaExhaustion(text string) bool {
 }
 
 func isModelQuotaExhaustion(text string) bool {
-	return strings.Contains(text, "used all the included free usage for model")
+	return strings.Contains(text, "used all the included free usage for model") ||
+		strings.Contains(text, "usage_limit_reached")
+}
+
+func isImageGenerationEmpty(text string) bool {
+	return strings.Contains(text, "image_generation_empty") ||
+		strings.Contains(text, "未解析到最终图片") ||
+		strings.Contains(text, "couldn't be rendered") ||
+		strings.Contains(text, "could not be rendered")
+}
+
+func isMediaRouteCapability(capability modeldomain.Capability) bool {
+	switch capability {
+	case modeldomain.CapabilityImage, modeldomain.CapabilityImageEdit, modeldomain.CapabilityVideo:
+		return true
+	default:
+		return false
+	}
 }
 
 func containsAny(text string, signals ...string) bool {

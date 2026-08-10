@@ -67,7 +67,13 @@ func (a *Adapter) ConvertToBuild(ctx context.Context, credential accountdomain.C
 	}
 	seed, err := flow.convert(requestCtx, credential)
 	if err != nil {
-		a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, conversionStatus(err), err)
+		status := conversionStatus(err)
+		if status > 0 {
+			// 上游 HTTP 语义错误（含 OAuth 400），出口传输本身可用。
+			a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, status, nil)
+		} else {
+			a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, 0, err)
+		}
 		return provider.CredentialSeed{}, err
 	}
 	a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, http.StatusOK, nil)

@@ -1,68 +1,147 @@
 # Resin Quality Guard Operations
 
-## Scenario: Isolation-driven Resin IP rotation
+## Scenario: Dynamic one-IP Resin quality slots
 
 ### 1. Scope / Trigger
 
-- Applies to the external `/root/resin` automation used by grok2api quality-guard nodes `14..23`.
-- Triggered only after the quality guard disables a managed node and calls the authenticated rotation webhook.
-- This integration must not require grok2api application source changes or a local binary rebuild.
+- Applies to `/root/resin` automation backing grok2api quality-guard nodes.
+- Also applies when `/root/proxy/proxyscrape_reg/maintain_high_score_sub.py`
+  replaces the dynamic `HighScore-LowRisk` subscription.
+- A confirmed real-model degradation disables one logical node and rotates only
+  the one physical IP behind its mapped Resin `qgN` platform.
+- No grok2api or Resin release build is required. Python automation is restarted
+  directly; compiled changes must use GitHub Actions.
 
 ### 2. Signatures
 
 - Webhook: `POST http://172.22.0.1:2271/rotate`
-- Request: `{"nodeId":"14".."23","oldExitIp":"<IPv4>"}`
-- Success: `{"changed":true,"nodeId":"...","slot":"qgN","oldExitIp":"...","newExitIp":"...","oldIpWeight":<number>}`
-- Maintenance command: `/root/resin/run_maintain_grok2api.sh`
-- Persistent reputation file: `/root/resin/data/grok2api_ip_weights.json`
+- Header: `Authorization: Bearer <QG_ROTATOR_TOKEN>`
+- Request: `{"nodeId":"<mapped-id>","oldExitIp":"<optional-cached-ip>"}`
+- Success: `{"changed":true,"nodeId":"...","slot":"qgN","oldExitIp":"...","newExitIp":"...","oldIpWeight":75,"staleExpectedExitIp":false}`
+- Mapping: `/root/resin/data/grok2api_qg_map.json`
+- Active inventory: `/root/resin/data/grok2api_qg_assignments.json`
+- Reserve inventory: `/root/resin/data/grok2api_qg_reserve.json`
+- Audit: `python3 /root/resin/audit_grok2api_qg.py --allowed-subscription-id <uuid> --reserve-target 20`
+- Staged reconciliation: `/root/resin/run_maintain_grok2api.sh --wait-lock --allowed-tags-file <tags.txt>`
+- `tags.txt` contains exact Resin tags, including the subscription prefix, one
+  per line: `HighScore-LowRisk/hq-<stable-endpoint-id>`.
+- Required rotator env: `QG_ALLOWED_SUBSCRIPTION_ID`, `QG_ROTATOR_TOKEN`.
+- Sidecar env: `QG_ACTIVE_CONCURRENCY=1`, `QG_MAX_ROTATION_ATTEMPTS=3`.
 
 ### 3. Contracts
 
-- `nodeId 14..23` maps one-to-one to Resin platforms `qg1..qg10`.
-- The main `grok2api` Resin platform targets 60 US nodes, with an allowed 55-65 band, `sticky_ttl=24h`, and `PREFER_LOW_LATENCY`.
-- Raw probe score must be at least 90. Candidate prefilter latency is at most 400ms and latency probing uses three attempts.
-- IP reputation starts at 100. Each guard isolation subtracts 25, with a floor of 10.
-- Effective selection rank is `raw_probe_score * ip_weight / 100`; reputation changes preference but never bypasses the raw quality gate.
-- Rotation replaces only the slot tag whose Resin `egress_ip` equals `oldExitIp`; unrelated healthy tags remain unchanged.
-- Active rotation overrides are merged with the current slot bucket and must never shrink an expanded slot. With a 60-node main pool, every healthy `qgN` target is six routable tags.
-- Resin has no native per-node weight field. The maintenance and rotation scripts own this reputation contract.
+- Candidate authorization is immutable Resin subscription ID
+  `15e2270d-68c3-4acf-bc84-d5033a4380ae`, never a name/prefix match.
+- Subscription membership is dynamic. Every maintenance run reads the current
+  member set; 50 main entries and 20 reserve entries are upper targets, not a
+  fixed expected IP count.
+- High-score Clash node names are stable for a proxy `host:port`; ranking and
+  score are metadata and must never be embedded in the tag identity.
+- Subscription replacement is a staged handoff: publish the union of old and
+  desired proxies, reconcile all managed platforms using only the desired
+  exact-tag allowlist, then publish desired-only content.
+- A failed or lock-blocked reconciliation must leave the compatibility union
+  published and return a failure. It must never remove the old routes.
+- The active hard floor is the number of entries in the explicit mapping. If
+  fewer distinct score-90 US IPs pass, leave the current pool unchanged.
+- One mapped grok2api node equals one Resin platform equals one routable US exit
+  IP. Logical node IDs and account assignments remain stable across rotation.
+- Multiple webhook node IDs may alias one Resin slot, but capacity, assignment,
+  reserve exclusion, maintenance repair, and audit counts must collapse aliases
+  by unique slot. An alias must never consume a second active IP.
+- Healthy active slots are preserved. Missing, cross-subscription, duplicate,
+  non-routable, or multi-IP slots are repaired from ranked eligible candidates.
+- Active and reserve IPs are distinct. Reserve shortage is a warning; empty
+  reserve makes rotation fail closed and keeps the logical node disabled.
+- Current slot IP is authoritative. Missing or stale request `oldExitIp` is
+  auditable but cannot block rotation when the slot is valid and one-IP.
+- Old IP/tag is quarantined for two hours and loses 25 reputation points, with a
+  weight floor of 10. Quarantine outranks current main-platform membership.
+- Maintainer and rotator share `/root/resin/data/grok2api_maintain.lock`; state
+  inventories are written atomically.
+- Both model probes and Resin candidate probes run at concurrency 1 in the
+  current environment. Canary evidence showed concurrency 4/10 can cause broad
+  proxy 502s and Resin circuit-open cascades.
+- Passive anomalies only request active confirmation. Only active model evidence
+  may disable or rotate a node, and a replacement is restored only after a
+  healthy real-model probe.
+- Ordinary request-health writes must preserve the persisted
+  `quality guard suspended` reason. Only the quality-suspension API may clear
+  that ownership marker during a verified restore.
 
 ### 4. Validation & Error Matrix
 
 | Condition | Required behavior |
 |---|---|
-| Missing or empty `oldExitIp` | Return HTTP 503; do not change the slot |
-| `oldExitIp` is not in the mapped `qgN` slot | Return HTTP 503; do not change the slot |
-| Node ID outside `14..23` | Return HTTP 503 |
-| Fewer replacement IPs than isolated tags | Return HTTP 503; keep the previous slot |
-| Replacement platform has zero routable nodes | Roll back the previous slot payload |
-| Observed exit IP does not change | Roll back the previous slot payload |
-| Probe wave yields fewer than half `min-keep` | Leave the main platform unchanged |
-| Active override contains fewer tags than a new bucket | Preserve override tags, then fill from the bucket to its target size |
+| Node ID absent from mapping | HTTP 503; no Resin mutation |
+| Slot has zero/multiple tags or routable count is not 1 | HTTP 503; repair via maintainer first |
+| Missing/stale request `oldExitIp` | Use current one-IP slot; return `staleExpectedExitIp: true` |
+| Candidate outside allowed subscription or non-US | Exclude before ranking |
+| Candidate is active, quarantined, same IP, or circuit-open | Exclude from reserve promotion |
+| Replacement count is not exactly one | Restore prior slot payload and return HTTP 503 |
+| Observed replacement IP differs from selected IP or equals old IP | Restore prior payload; HTTP 503 |
+| Passing unique IPs are fewer than mapped active slots | Report active capacity exhaustion; do not patch main/qg platforms |
+| Reserve below target | Apply healthy active state; emit warning with actual/target counts |
+| Reserve empty during degradation | Keep logical node disabled; report candidate exhaustion |
+| Passive-only anomaly | Run active confirmation; do not mutate routing directly |
+| Desired tag file missing or empty | Abort reconciliation; retain old/union subscription routes |
+| Desired tags do not resolve inside the allowed subscription ID | Fail closed; do not finalize desired-only content |
+| Staged reconciliation fails or times out | Keep the old+new compatibility union; surface a non-zero result |
+| Staged reconciliation succeeds | Finalize desired-only subscription content; all main/qg tags must be desired tags |
 
 ### 5. Good/Base/Bad Cases
 
-- Good: one of six `qg7` tags matches the isolated IP; only that tag is replaced, its IP weight becomes 75, and the other five tags stay unchanged.
-- Base: an IP has no reputation record; treat it as weight 100.
-- Bad: a stale webhook names an IP no longer present in the slot; reject it instead of rotating an unrelated IP.
+- Good: node `20` is actively classified `hard_tps`; its current qg IP is
+  quarantined, one reserve IP is promoted, the model probe passes, and node `20`
+  is restored without changing its ID.
+- Base: a screened subscription changes from 31 to 80 members. The next serial
+  maintainer run discovers the new set and rebuilds 10 active plus up to 20
+  reserve entries without configuration changes.
+- Bad: treating an empty cached `exitIp` as fatal strands a repaired slot. The
+  one-IP platform must identify the old IP authoritatively.
+- Bad: raising probe concurrency without a canary can open many Resin circuits;
+  do not infer safe concurrency from CPU capacity.
+- Good: a four-hour high-score refresh keeps old routes present while the
+  maintainer probes and binds the new stable tags, then removes obsolete tags.
+- Bad: naming nodes `hq001-<ip>-s99` makes every ranking change invalidate all
+  platform regex bindings and produces `NO_AVAILABLE_NODES` until the next
+  maintenance cycle.
 
 ### 6. Tests Required
 
-- Unit: node ID to slot mapping accepts exactly `14..23`.
-- Unit: replacement changes only tags matching the isolated IP.
-- Unit: missing/stale isolated IP is rejected.
-- Unit: higher IP reputation wins replacement and pool ranking.
-- Unit: repeated penalties clamp at weight 10 and survive JSON round-trip.
-- Regression: merging a two-tag active override into a six-tag bucket returns six tags.
-- Integration: main platform is 60 US routable nodes and every `qg1..qg10` platform has six routable nodes.
-- Runtime: webhook health is reachable from both the host and grok2api container.
+- Unit: explicit mapping rejects malformed IDs and duplicate slots.
+- Unit: allowed-subscription normalization excludes all other subscriptions.
+- Unit: pool decisions and reserve ranking deduplicate physical exit IPs.
+- Unit: reserve entries revalidate their per-entry subscription ID, US region,
+  active overlap, quarantine, outbound status, and circuit status.
+- Regression: missing cached old IP rotates the current one-IP slot.
+- Regression: quarantined current members cannot re-enter candidate/reserve
+  selection.
+- Audit: detect missing/multi-IP slots, duplicate active IPs, assignment drift,
+  cross-subscription reserve entries, non-US nodes, and reserve shortage.
+- Sidecar: passive evidence requires active confirmation, scheduled probes obey
+  concurrency, and recovery tries at most three distinct replacements.
+- Runtime: webhook works from host and grok2api container; audit returns `ok`;
+  one controlled degradation changes IP, preserves node ID, and restores only
+  after a healthy real-model probe.
+- Unit: stable proxy tags do not change with ranking, score, or credential
+  rotation for the same `host:port`.
+- Unit: staged publish writes old+new first, invokes exact-tag reconciliation,
+  and writes desired-only last; reconciliation failure performs no final write.
 
 ### 7. Wrong vs Correct
 
 #### Wrong
 
-Replace all tags in a `qgN` slot when only one exit IP was isolated, or assign an old three-tag override directly to a new six-tag bucket.
+Derive `qgN` from node-ID arithmetic, put six IPs behind one logical node,
+assume the subscription always contains 80 IPs, or re-add a quarantined current
+member because it still matches the main platform regex. Do not overwrite a
+live subscription with ranking-derived tags before managed platforms rebind.
 
 #### Correct
 
-Identify tags by exact `egress_ip`, replace only those tags with the highest-reputation eligible candidates, and merge active override tags with the current bucket up to the bucket's target size.
+Resolve the node through the persisted mapping, keep exactly one unique allowed
+US IP per slot, discover screened capacity on each run, preserve healthy slots,
+and promote only a revalidated reserve candidate under the shared lock. Replace
+screened subscription content through the compatibility-union handoff and
+finalize only after exact desired-tag reconciliation succeeds.

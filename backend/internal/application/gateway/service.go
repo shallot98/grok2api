@@ -52,6 +52,7 @@ const finalizationTimeout = 5 * time.Second
 const minimumTextBillingReservationTTL = 2 * time.Hour
 const billingReservationCrashGrace = 10 * time.Minute
 const mediaBillingReservationTTL = 24 * time.Hour
+const mediaRateLimitCooldown = 15 * time.Minute
 const modelCatalogRefreshTimeout = 30 * time.Second
 const accountStateWriteTimeout = 3 * time.Second
 const unlimitedRoutingAttempts = -1
@@ -108,6 +109,9 @@ type Input struct {
 	// ForcedEgressNodeID is an internal-only administrator probe constraint.
 	// Public inference handlers never populate it.
 	ForcedEgressNodeID uint64
+	// ForcedAccountID is an internal-only quality-probe constraint. It reuses
+	// the pinned selector while ForcedEgressNodeID controls the physical route.
+	ForcedAccountID uint64
 }
 
 type Usage struct {
@@ -125,6 +129,7 @@ type Usage struct {
 }
 
 type Result struct {
+	AccountID           uint64
 	StatusCode          int
 	Status              string
 	Header              http.Header
@@ -896,9 +901,11 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	if input.PreviousResponseID != "" && !supportsStoredResponses {
 		return nil, ErrResponseStateUnsupported
 	}
+
 	attemptPolicy := newRoutingAttemptPolicy(int(s.maxAttempts.Load()))
+
 	idempotencyID, _ := security.NewOpaqueToken(18)
-	if ownership != nil {
+	if ownership != nil || input.ForcedAccountID != 0 {
 		attemptPolicy = newRoutingAttemptPolicy(1)
 	}
 	pricingModel := s.providers.PricingModel(route.Provider, route.UpstreamModel)
@@ -943,6 +950,8 @@ attemptLoop:
 		selectionStarted := time.Now()
 		if ownership != nil {
 			lease, err = s.selector.AcquirePinnedForKey(ctx, route.Provider, ownership.AccountID, route.ID, route.UpstreamModel, quotaMode, true, accountScope)
+		} else if input.ForcedAccountID != 0 {
+			lease, err = s.selector.AcquirePinnedForQualityProbe(ctx, route.Provider, input.ForcedAccountID, route.ID, route.UpstreamModel, quotaMode, accountScope)
 		} else if input.ForcedEgressNodeID != 0 {
 			lease, err = s.selector.AcquireForKeyOnEgressNode(ctx, route.Provider, route.ID, route.UpstreamModel, quotaMode, affinityKey, excluded, !quotaProbeAttempted, accountScope, input.ForcedEgressNodeID)
 		} else {
@@ -1084,11 +1093,13 @@ attemptLoop:
 			}
 		}
 		egressForbidden := s.providers.RetryForbiddenAsEgress(credential.Provider) && response.StatusCode == http.StatusForbidden
+
 		finalEgressForbidden := egressForbidden && (attempt > 0 || !attemptPolicy.hasNext(attempt))
 		// Classify 403 bodies before egress retry. Definitive blocked-account signals invalidate and rotate the account;
 		// request-level safety rejections are returned as-is without account side effects;
 		// all other 403 responses retain the egress retry path without penalizing the account.
 		if response.StatusCode == http.StatusForbidden {
+
 			retryAfter := parseRetryAfter(response.Header.Get("Retry-After"), time.Now().UTC())
 			body, _ := readRetryableBody(response.Body)
 			lastFailure = newHTTPUpstreamFailure(response.StatusCode, body, credential.ID, credential.Name)
@@ -1204,7 +1215,13 @@ attemptLoop:
 				s.selector.MarkFreeQuotaExhausted(ctx, credential, used, limit)
 				failureHandled = true
 			} else if lastFailure.ModelQuotaExhausted {
-				s.selector.MarkModelQuotaExhausted(ctx, credential, lease.Billing, route.UpstreamModel, retryAfter)
+				// Model-scoped cooldowns (free model quota, Lite image empty/rate-limit)
+				// must not take the whole account offline for unrelated models.
+				cooldown := retryAfter
+				if cooldown <= 0 && isMediaRouteCapability(route.Capability) {
+					cooldown = mediaRateLimitCooldown
+				}
+				s.selector.MarkModelQuotaExhausted(ctx, credential, lease.Billing, route.UpstreamModel, cooldown)
 				failureHandled = true
 			} else if lastFailure.FreeQuotaExhausted {
 				s.selector.MarkFreeQuotaExhausted(ctx, credential, 0, 0)
@@ -1378,7 +1395,7 @@ attemptLoop:
 			markFirstToken = firstToken.mark
 		}
 		timingHandedOff = true
-		return &Result{StatusCode: response.StatusCode, Status: response.Status, Header: response.Header, Body: &finalizingBody{ReadCloser: response.Body, finalize: func() { finalize(Usage{}, "", "stream_closed") }}, MarkFirstToken: markFirstToken, RecordStreamFailure: recordStreamFailure, Finalize: finalize}, nil
+		return &Result{AccountID: accountID, StatusCode: response.StatusCode, Status: response.Status, Header: response.Header, Body: &finalizingBody{ReadCloser: response.Body, finalize: func() { finalize(Usage{}, "", "stream_closed") }}, MarkFirstToken: markFirstToken, RecordStreamFailure: recordStreamFailure, Finalize: finalize}, nil
 	}
 	if lastFailure != nil {
 		record := auditBase

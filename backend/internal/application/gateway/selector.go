@@ -270,6 +270,7 @@ type Selector struct {
 	selectionMu            sync.RWMutex
 	quotaMu                sync.RWMutex
 	staleLogMu             sync.Mutex
+	qualityNodeMu          sync.RWMutex
 	logger                 *slog.Logger
 	leaseWakeMu            sync.Mutex
 	leaseWake              chan struct{}
@@ -281,6 +282,7 @@ type Selector struct {
 	routingBases           map[routingBaseCacheKey]routingBaseSnapshot
 	routingOverlays        map[routingOverlayCacheKey]routingOverlaySnapshot
 	routingAccountProvider map[uint64]account.Provider
+	qualitySuspendedNodes  map[uint64]bool
 	baseGlobalVersion      uint64
 	overlayGlobalVersion   uint64
 	baseProviderVersion    map[account.Provider]uint64
@@ -299,7 +301,30 @@ func NewSelector(accounts repository.AccountRepository, concurrency repository.C
 	if len(capacityWait) > 0 && capacityWait[0] > 0 {
 		wait = capacityWait[0]
 	}
-	return &Selector{accounts: accounts, concurrency: concurrency, sticky: sticky, tierOrders: tierOrders, stickyTTL: stickyTTL, cooldownBase: cooldownBase, cooldownMax: cooldownMax, capacityWait: wait, leaseWake: make(chan struct{}), logger: slog.Default(), lastSelectedAt: make(map[uint64]time.Time), lastSuccessAt: make(map[uint64]time.Time), quotaConsumed: make(map[quotaConsumptionKey]int), staleFallbackLoggedAt: make(map[string]time.Time), candidates: make(map[candidateCacheKey]candidateSnapshot), routingBases: make(map[routingBaseCacheKey]routingBaseSnapshot), routingOverlays: make(map[routingOverlayCacheKey]routingOverlaySnapshot), routingAccountProvider: make(map[uint64]account.Provider), baseProviderVersion: make(map[account.Provider]uint64), overlayProviderVersion: make(map[account.Provider]uint64), concurrencySnapshots: resultcache.New[[32]byte, map[string]int](maxConcurrencySnapshots, concurrencySnapshotTTL)}
+	return &Selector{accounts: accounts, concurrency: concurrency, sticky: sticky, tierOrders: tierOrders, stickyTTL: stickyTTL, cooldownBase: cooldownBase, cooldownMax: cooldownMax, capacityWait: wait, leaseWake: make(chan struct{}), logger: slog.Default(), lastSelectedAt: make(map[uint64]time.Time), lastSuccessAt: make(map[uint64]time.Time), quotaConsumed: make(map[quotaConsumptionKey]int), staleFallbackLoggedAt: make(map[string]time.Time), candidates: make(map[candidateCacheKey]candidateSnapshot), routingBases: make(map[routingBaseCacheKey]routingBaseSnapshot), routingOverlays: make(map[routingOverlayCacheKey]routingOverlaySnapshot), routingAccountProvider: make(map[uint64]account.Provider), qualitySuspendedNodes: make(map[uint64]bool), baseProviderVersion: make(map[account.Provider]uint64), overlayProviderVersion: make(map[account.Provider]uint64), concurrencySnapshots: resultcache.New[[32]byte, map[string]int](maxConcurrencySnapshots, concurrencySnapshotTTL)}
+}
+
+func (s *Selector) SetQualityNodeSuspended(nodeID uint64, suspended bool) {
+	if nodeID == 0 {
+		return
+	}
+	s.qualityNodeMu.Lock()
+	if suspended {
+		s.qualitySuspendedNodes[nodeID] = true
+	} else {
+		delete(s.qualitySuspendedNodes, nodeID)
+	}
+	s.qualityNodeMu.Unlock()
+}
+
+func (s *Selector) qualityNodeSuspended(nodeID uint64) bool {
+	if nodeID == 0 {
+		return false
+	}
+	s.qualityNodeMu.RLock()
+	suspended := s.qualitySuspendedNodes[nodeID]
+	s.qualityNodeMu.RUnlock()
+	return suspended
 }
 
 // SetLogger wires the application logger into routing degradation diagnostics.
@@ -452,6 +477,9 @@ func (s *Selector) acquire(ctx context.Context, provider account.Provider, model
 	var earliestRetry time.Time
 	for index, candidate := range values {
 		value := candidate.Credential
+		if forcedEgressNodeID == 0 && s.qualityNodeSuspended(value.EgressNodeID) {
+			continue
+		}
 		if forcedEgressNodeID != 0 && value.EgressNodeID != forcedEgressNodeID {
 			continue
 		}
@@ -723,14 +751,18 @@ func isSelectionUnavailable(err error, reason SelectionUnavailableReason) bool {
 
 // AcquirePinned 为 previous_response_id 等账号归属请求获取指定账号租约。
 func (s *Selector) AcquirePinned(ctx context.Context, provider account.Provider, accountID, modelRouteID uint64, upstreamModel, quotaMode string, inference bool) (*accountLease, error) {
-	return s.acquirePinned(ctx, provider, accountID, modelRouteID, upstreamModel, quotaMode, inference, clientkeydomain.AccountScope{})
+	return s.acquirePinned(ctx, provider, accountID, modelRouteID, upstreamModel, quotaMode, inference, clientkeydomain.AccountScope{}, false)
 }
 
 func (s *Selector) AcquirePinnedForKey(ctx context.Context, provider account.Provider, accountID, modelRouteID uint64, upstreamModel, quotaMode string, inference bool, scope clientkeydomain.AccountScope) (*accountLease, error) {
-	return s.acquirePinned(ctx, provider, accountID, modelRouteID, upstreamModel, quotaMode, inference, scope)
+	return s.acquirePinned(ctx, provider, accountID, modelRouteID, upstreamModel, quotaMode, inference, scope, false)
 }
 
-func (s *Selector) acquirePinned(ctx context.Context, provider account.Provider, accountID, modelRouteID uint64, upstreamModel, quotaMode string, inference bool, requestedScope clientkeydomain.AccountScope) (lease *accountLease, err error) {
+func (s *Selector) AcquirePinnedForQualityProbe(ctx context.Context, provider account.Provider, accountID, modelRouteID uint64, upstreamModel, quotaMode string, scope clientkeydomain.AccountScope) (*accountLease, error) {
+	return s.acquirePinned(ctx, provider, accountID, modelRouteID, upstreamModel, quotaMode, true, scope, true)
+}
+
+func (s *Selector) acquirePinned(ctx context.Context, provider account.Provider, accountID, modelRouteID uint64, upstreamModel, quotaMode string, inference bool, requestedScope clientkeydomain.AccountScope, allowQualitySuspended bool) (lease *accountLease, err error) {
 	accountScope, scopeValid := clientkeydomain.NormalizeAccountScope(requestedScope)
 	defer annotateSelectionAccountScope(&err, accountScope)
 	if !scopeValid || !accountScope.AllowsProvider(provider) {
@@ -746,6 +778,9 @@ func (s *Selector) acquirePinned(ctx context.Context, provider account.Provider,
 		value := candidate.Credential
 		if value.ID != accountID {
 			continue
+		}
+		if !allowQualitySuspended && s.qualityNodeSuspended(value.EgressNodeID) {
+			return nil, &SelectionUnavailableError{Reason: SelectionNoAccounts}
 		}
 		if !accountScopeAllowsCandidate(provider, accountScope, candidate) {
 			return nil, &SelectionUnavailableError{Reason: SelectionNoAccounts}
@@ -942,6 +977,27 @@ func (s *Selector) MarkModelAccessDenied(ctx context.Context, credential account
 	if err := s.accounts.UpsertModelQuotaBlock(ctx, account.ModelQuotaBlock{
 		AccountID: credential.ID, UpstreamModel: upstreamModel, Reason: "model_access_denied",
 		CooldownUntil: now.Add(retryAfter), UpdatedAt: now,
+	}); err != nil {
+		return err
+	}
+	s.evictCandidate(credential.Provider, credential.ID)
+	return nil
+}
+
+// MarkModelQualityDegraded temporarily removes one account from one model
+// after the same account remains degraded across a confirmed IP replacement.
+func (s *Selector) MarkModelQualityDegraded(ctx context.Context, credential account.Credential, upstreamModel string, cooldown time.Duration) error {
+	upstreamModel = strings.TrimSpace(upstreamModel)
+	if upstreamModel == "" {
+		return errors.New("quality-degraded model is empty")
+	}
+	if cooldown <= 0 {
+		cooldown = 15 * time.Minute
+	}
+	now := time.Now().UTC()
+	if err := s.accounts.UpsertModelQuotaBlock(ctx, account.ModelQuotaBlock{
+		AccountID: credential.ID, UpstreamModel: upstreamModel, Reason: "quality_degraded",
+		CooldownUntil: now.Add(cooldown), UpdatedAt: now,
 	}); err != nil {
 		return err
 	}

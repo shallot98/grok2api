@@ -327,6 +327,24 @@ func TestHTTPUpstreamFailureKeepsExplicitModelFreeUsageScoped(t *testing.T) {
 	}
 }
 
+func TestHTTPUpstreamFailureClassifiesImageGenerationEmpty(t *testing.T) {
+	body := `{"error":{"message":"Grok Web Lite 响应结束但未解析到最终图片","type":"server_error","code":"image_generation_empty"}}`
+	failure := newHTTPUpstreamFailure(http.StatusBadGateway, []byte(body), 9, "web")
+	if failure.Code != "image_generation_empty" || failure.PublicMessage != "上游未返回图片，请稍后重试" {
+		t.Fatalf("failure = %#v", failure)
+	}
+	if !failure.AccountScoped || !failure.ModelQuotaExhausted || failure.HTTPStatus != http.StatusBadGateway {
+		t.Fatalf("image empty should cool down the model: %#v", failure)
+	}
+}
+
+func TestTransportUpstreamFailureClassifiesRenderFailureAsImageEmpty(t *testing.T) {
+	failure := newTransportUpstreamFailure(errors.New("Some content couldn't be rendered"), 9, "web")
+	if failure.Code != "image_generation_empty" || !failure.AccountScoped || !failure.ModelQuotaExhausted {
+		t.Fatalf("failure = %#v", failure)
+	}
+}
+
 func TestBuildRateLimitForcesAccountFailoverDespiteRetryVeto(t *testing.T) {
 	response := &provider.Response{
 		StatusCode: http.StatusTooManyRequests,

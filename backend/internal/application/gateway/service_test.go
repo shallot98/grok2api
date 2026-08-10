@@ -2044,6 +2044,94 @@ func TestImageStreamPropagatesWithoutTouchingChatQuota(t *testing.T) {
 	}
 }
 
+func TestGenerateImageRotatesOnEmptyLitePayload(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "web-image-empty.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accountRepo := relational.NewAccountRepository(database)
+	modelRepo := relational.NewModelRepository(database)
+	auditRepo := relational.NewAuditRepository(database)
+	responseRepo := relational.NewResponseRepository(database)
+	keyRepo := relational.NewClientKeyRepository(database)
+	credentials := make([]account.Credential, 0, 2)
+	for index, name := range []string{"empty-image", "healthy-image"} {
+		credential, _, createErr := accountRepo.UpsertByIdentity(ctx, account.Credential{
+			Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, WebTier: account.WebTierSuper,
+			Name: name, SourceKey: name, EncryptedAccessToken: "encrypted-" + name,
+			Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 200 - index*100, MaxConcurrent: 1,
+		})
+		if createErr != nil {
+			t.Fatal(createErr)
+		}
+		credentials = append(credentials, credential)
+	}
+	now := time.Now().UTC()
+	const model = "grok-image-empty"
+	if err := modelRepo.UpsertRoutes(ctx, []modeldomain.Route{{
+		PublicID: model, Provider: account.ProviderWeb, UpstreamModel: model,
+		Capability: modeldomain.CapabilityImage, Enabled: true,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, credential := range credentials {
+		if err := modelRepo.ReplaceAccountCapabilities(ctx, credential.ID, []string{model}, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	key, err := keyRepo.Create(ctx, clientkey.Key{
+		Name: "image-empty-key", Prefix: "image-empty", SecretHash: strings.Repeat("e", 64), EncryptedSecret: "encrypted-key",
+		Enabled: true, RPMLimit: 60, MaxConcurrent: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := &webImageStreamAdapter{emptyRemaining: 1}
+	registry := provider.NewRegistry(adapter)
+	sticky := memory.NewStickyStore()
+	accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), sticky, registry, testCipher(t), nil)
+	selector := NewSelector(accountRepo, memory.NewConcurrencyLimiter(), sticky, registry, time.Hour, time.Second, time.Minute)
+	service := NewService(modelRepo, auditRepo, accountService, clientkeyapp.NewService(keyRepo, nil, nil, 60, 4, nil), registry, selector, responseRepo, 2)
+
+	result, err := service.GenerateImage(ctx, ImageGenerationInput{
+		RequestID: "req-image-empty", ClientKey: key, PublicModel: model, Prompt: "test", Count: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(result.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result.Finalize(Usage{}, "", "")
+	_ = result.Body.Close()
+	if result.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d body=%s", result.StatusCode, body)
+	}
+	if attempts := adapter.Attempts(); len(attempts) != 2 || attempts[0] != credentials[0].ID || attempts[1] != credentials[1].ID {
+		t.Fatalf("attempts = %#v, want empty account then healthy account", attempts)
+	}
+	candidates, err := accountRepo.ListRoutingCandidates(ctx, account.ProviderWeb, 0, model, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var emptyCandidate *account.RoutingCandidate
+	for index := range candidates {
+		if candidates[index].Credential.ID == credentials[0].ID {
+			emptyCandidate = &candidates[index]
+			break
+		}
+	}
+	if emptyCandidate == nil || emptyCandidate.ModelQuotaBlock == nil || emptyCandidate.ModelQuotaBlock.Reason != "model_quota_depleted" || emptyCandidate.ModelQuotaBlock.UpstreamModel != model {
+		t.Fatalf("empty account routing candidate = %#v", emptyCandidate)
+	}
+}
+
 func TestWebImageUnauthorizedMarksInvalidAndSwitchesAccount(t *testing.T) {
 	ctx := context.Background()
 	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "web-image-401.db"))
@@ -3611,6 +3699,7 @@ type webImageStreamAdapter struct {
 	attempts           []uint64
 	unauthorizedID     uint64
 	forbiddenRemaining int
+	emptyRemaining     int
 }
 
 type webChatQuotaAdapter struct {
@@ -3678,11 +3767,24 @@ func (a *webImageStreamAdapter) GenerateImage(ctx context.Context, request provi
 	if forbidden {
 		a.forbiddenRemaining--
 	}
+	empty := a.emptyRemaining > 0
+	if empty {
+		a.emptyRemaining--
+	}
 	a.mu.Unlock()
 	if forbidden {
 		return &provider.Response{
 			StatusCode: http.StatusForbidden, Status: "403 Forbidden", Header: make(http.Header),
 			Body: io.NopCloser(strings.NewReader(`{"error":"egress session rejected"}`)),
+		}, nil
+	}
+	if empty {
+		header := make(http.Header)
+		header.Set("Content-Type", "application/json")
+		header.Set("Retry-After", "300")
+		return &provider.Response{
+			StatusCode: http.StatusBadGateway, Status: "502 Bad Gateway", Header: header,
+			Body: io.NopCloser(strings.NewReader(`{"error":{"message":"Grok Web Lite 响应结束但未解析到最终图片","type":"server_error","code":"image_generation_empty"}}`)),
 		}, nil
 	}
 	if request.Credential.ID == unauthorizedID {

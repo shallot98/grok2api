@@ -50,3 +50,10 @@ __pycache__/
 /.tmp/
 /tmp/
 /Dockerfile.local
+
+# Local deployment backups (never commit)
+/backups/
+*.bak
+*.bak.*
+/config.yaml.bak*
+/docker-compose.yml.bak*

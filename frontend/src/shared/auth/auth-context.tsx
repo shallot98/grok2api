@@ -20,14 +20,34 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const restoreSession = useCallback(async (): Promise<void> => {
     setStatus("restoring");
     const refreshResult = await refreshAccessToken();
-    if (refreshResult === "invalid") {
-      setAdmin(null);
-      setStatus("anonymous");
-      return;
-    }
     if (refreshResult === "unavailable") {
       setStatus("unavailable");
       return;
+    }
+    if (refreshResult === "invalid") {
+      // 无有效 refresh cookie 时，尝试受信 IP 免密登录。
+      try {
+        const trusted = await apiRequest("/api/admin/v1/auth/trusted-login", {
+          method: "POST",
+          body: {},
+          authenticated: false,
+          retryAuth: false,
+        }, decodeLoginResponseDTO);
+        setAccessToken(trusted.tokens.accessToken);
+        setAdmin(trusted.admin);
+        setStatus("authenticated");
+        return;
+      } catch (error) {
+        setAccessToken(null);
+        setAdmin(null);
+        // 非白名单 IP 返回 401，正常落到登录页；服务异常则提示重试。
+        if (error instanceof ApiError && error.status === 401) {
+          setStatus("anonymous");
+          return;
+        }
+        setStatus("unavailable");
+        return;
+      }
     }
 
     try {

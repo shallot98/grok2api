@@ -1,9 +1,11 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"sync"
 	"time"
@@ -253,6 +255,30 @@ func (s *Service) executeImage(
 				_, _ = readRetryableBody(response.Body)
 				lease.Release()
 				continue
+			}
+		}
+		// Lite Imagine soft-stop / empty payloads are account+model specific. Cool
+		// down only this model and rotate to another credential while attempts remain.
+		if response.StatusCode >= http.StatusInternalServerError || response.StatusCode == http.StatusTooManyRequests {
+			retryAfter := parseRetryAfter(response.Header.Get("Retry-After"), time.Now().UTC())
+			body, _ := readRetryableBody(response.Body)
+			failure := newHTTPUpstreamFailure(response.StatusCode, body, credential.ID, credential.Name)
+			if failure.Code == "image_generation_empty" || failure.ModelQuotaExhausted || isImageGenerationEmpty(string(body)) {
+				cooldown := retryAfter
+				if cooldown <= 0 {
+					cooldown = mediaRateLimitCooldown
+				}
+				s.selector.MarkModelQuotaExhausted(ctx, credential, lease.Billing, route.UpstreamModel, cooldown)
+				if attemptPolicy.hasNext(attempt) {
+					lease.Release()
+					response = nil
+					continue
+				}
+			}
+			// Restore body so the client still receives the upstream error payload.
+			response.Body = io.NopCloser(bytes.NewReader(body))
+			if response.Header == nil {
+				response.Header = make(http.Header)
 			}
 		}
 		break
