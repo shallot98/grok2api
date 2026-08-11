@@ -27,6 +27,8 @@
   per line: `HighScore-LowRisk/hq-<stable-endpoint-id>`.
 - Required rotator env: `QG_ALLOWED_SUBSCRIPTION_ID`, `QG_ROTATOR_TOKEN`.
 - Sidecar env: `QG_ACTIVE_CONCURRENCY=1`, `QG_MAX_ROTATION_ATTEMPTS=3`.
+- Sidecar liveness field: `state.json.updated_at`; refresh interval while a
+  model request is pending: `LIVENESS_INTERVAL_SECONDS=15`.
 
 ### 3. Contracts
 
@@ -68,6 +70,11 @@
 - Ordinary request-health writes must preserve the persisted
   `quality guard suspended` reason. Only the quality-suspension API may clear
   that ownership marker during a verified restore.
+- Active model probes routinely exceed the admin UI's 60-second freshness
+  floor. Every blocking quality probe path, including scheduled concurrency,
+  passive confirmation, replacement verification, and sentinel attribution,
+  must refresh `updated_at` while pending without changing probe results or
+  guard metadata.
 
 ### 4. Validation & Error Matrix
 
@@ -88,6 +95,8 @@
 | Desired tags do not resolve inside the allowed subscription ID | Fail closed; do not finalize desired-only content |
 | Staged reconciliation fails or times out | Keep the old+new compatibility union; surface a non-zero result |
 | Staged reconciliation succeeds | Finalize desired-only subscription content; all main/qg tags must be desired tags |
+| Model probe remains pending for more than 60 seconds | Refresh `updated_at` at most every 15 seconds; keep the sidecar status fresh |
+| Model probe raises or completes | Preserve the original exception/result after heartbeat updates |
 
 ### 5. Good/Base/Bad Cases
 
@@ -106,6 +115,10 @@
 - Bad: naming nodes `hq001-<ip>-s99` makes every ranking change invalidate all
   platform regex bindings and produces `NO_AVAILABLE_NODES` until the next
   maintenance cycle.
+- Good: an 85-second real-model probe keeps `updated_at` fresh while pending,
+  then applies the actual probe classification exactly once.
+- Bad: updating state only before and after a long probe makes the running
+  sidecar appear stale and causes operators to restart a healthy guard.
 
 ### 6. Tests Required
 
@@ -128,6 +141,8 @@
   rotation for the same `host:port`.
 - Unit: staged publish writes old+new first, invokes exact-tag reconciliation,
   and writes desired-only last; reconciliation failure performs no final write.
+- Sidecar regression: a blocked single probe and a blocked scheduled concurrent
+  cycle both advance persisted `updated_at` before the request completes.
 
 ### 7. Wrong vs Correct
 
@@ -145,3 +160,6 @@ US IP per slot, discover screened capacity on each run, preserve healthy slots,
 and promote only a revalidated reserve candidate under the shared lock. Replace
 screened subscription content through the compatibility-union handoff and
 finalize only after exact desired-tag reconciliation succeeds.
+Keep the persisted sidecar heartbeat advancing during every blocking model
+request so status freshness represents process liveness rather than probe
+latency.

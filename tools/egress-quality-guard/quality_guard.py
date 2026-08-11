@@ -23,10 +23,12 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any
 
+
+LIVENESS_INTERVAL_SECONDS = 15.0
 
 RUNTIME_CONFIG_FIELDS = {
     "mode",
@@ -575,6 +577,25 @@ class Guard:
         self._update_guard_metadata()
         save_state(self.config.state_file, self.state)
 
+    def _touch_liveness(self) -> None:
+        """Refresh status freshness without rewriting guard metadata."""
+        self.state["updated_at"] = time.time()
+        save_state(self.config.state_file, self.state)
+
+    def _call_with_liveness(self, func: Any, /, *args: Any, **kwargs: Any) -> Any:
+        """Run a blocking call while keeping admin status from going stale."""
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(func, *args, **kwargs)
+            pending: set[Future[Any]] = {future}
+            while pending:
+                done, pending = wait(pending, timeout=LIVENESS_INTERVAL_SECONDS)
+                if not done:
+                    self._touch_liveness()
+                    pending = {future}
+                    continue
+                return future.result()
+        raise RuntimeError("liveness wait returned without a result")
+
     def _state_for(self, node_id: str) -> dict[str, Any]:
         nodes = self.state.setdefault("nodes", {})
         current = nodes.setdefault(node_id, default_node_state())
@@ -796,8 +817,11 @@ class Guard:
         state = self._state_for(str(node["id"]))
         if state.get("last_reason") == "probe_no_account" and now < float(state.get("quarantined_until", 0.0)):
             return
+        self._touch_liveness()
         try:
-            outcome: dict[str, Any] | Exception = self.api.quality_test(str(node["id"]), account_id)
+            outcome: dict[str, Any] | Exception = self._call_with_liveness(
+                self.api.quality_test, str(node["id"]), account_id
+            )
         except Exception as exc:  # noqa: BLE001 - active probe boundary
             outcome = exc
         self._apply_active_probe(nodes, node, now, trigger, outcome, account_id)
@@ -865,7 +889,7 @@ class Guard:
                     connectivity_status = "error"
                     log_event("recovery_connectivity_probe_failed", node_id=node_id, node_name=node.get("name"), attempt=attempt, error_type=type(exc).__name__)
                 self._bump_statistic("active", "total")
-                result = self.api.quality_test(node_id, affected_account_id)
+                result = self._call_with_liveness(self.api.quality_test, node_id, affected_account_id)
                 classification, reason = classify_result(result, self.config)
                 self._record_probe(node, result, classification, reason, time.time())
             except Exception as exc:
@@ -910,7 +934,7 @@ class Guard:
             if affected_account_id:
                 try:
                     self.api.quarantine_account(affected_account_id)
-                    sentinel = self.api.quality_test(node_id)
+                    sentinel = self._call_with_liveness(self.api.quality_test, node_id)
                     sentinel_classification, sentinel_reason = classify_result(sentinel, self.config)
                     self._record_probe(node, sentinel, sentinel_classification, sentinel_reason, time.time())
                 except Exception as exc:
@@ -1090,14 +1114,20 @@ class Guard:
         with ThreadPoolExecutor(max_workers=self.config.active_concurrency) as executor:
             for node in scheduled:
                 futures[executor.submit(self.api.quality_test, str(node["id"]))] = node
-            for future in as_completed(futures):
-                node = futures[future]
-                try:
-                    outcome: dict[str, Any] | Exception = future.result()
-                except Exception as exc:  # noqa: BLE001 - concurrent probe boundary
-                    outcome = exc
-                self._apply_active_probe(all_nodes, node, now, "scheduled", outcome)
-                self._save()
+            pending: set[Future[dict[str, Any]]] = set(futures)
+            while pending:
+                done, pending = wait(pending, timeout=LIVENESS_INTERVAL_SECONDS)
+                if not done:
+                    self._touch_liveness()
+                    continue
+                for future in done:
+                    node = futures[future]
+                    try:
+                        outcome: dict[str, Any] | Exception = future.result()
+                    except Exception as exc:  # noqa: BLE001 - concurrent probe boundary
+                        outcome = exc
+                    self._apply_active_probe(all_nodes, node, now, "scheduled", outcome)
+                    self._save()
 
         self.state["last_active_cycle_at"] = time.time()
         self._save()
@@ -1212,6 +1242,7 @@ class Guard:
     def run_passive_cycle(self) -> None:
         now = time.time()
         self.state["last_passive_poll_at"] = now
+        self._touch_liveness()
         all_nodes, nodes, _skip_ids = self._prepare_nodes(now)
         node_by_id = {str(node["id"]): node for node in nodes}
         audits = self._fetch_new_audits()
