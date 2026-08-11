@@ -3,7 +3,10 @@ import json
 import stat
 import sys
 import tempfile
+import threading
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 
@@ -217,6 +220,42 @@ class GuardTests(unittest.TestCase):
     @staticmethod
     def nodes(count=5):
         return [{"id": str(index), "name": f"node-{index}", "enabled": True, "proxyConfigured": True} for index in range(1, count + 1)]
+
+    def test_liveness_refreshes_during_long_probe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = config(state_file=Path(directory) / "state.json", lock_file=Path(directory) / "lock", node_ids=("1",))
+            started = threading.Event()
+            release = threading.Event()
+
+            class SlowApi(FakeApi):
+                def quality_test(self, node_id):
+                    started.set()
+                    if not release.wait(2.0):
+                        raise TimeoutError("slow probe was not released")
+                    return {"expectedMatched": True, "outputTokens": 100, "outputTokensPerSecond": 50}
+
+            api = SlowApi(self.nodes(1), [])
+            guard = quality_guard.Guard(cfg, api)
+            original_interval = quality_guard.LIVENESS_INTERVAL_SECONDS
+            quality_guard.LIVENESS_INTERVAL_SECONDS = 0.05
+            try:
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(guard._probe_active, api.nodes, api.nodes[0], time.time())
+                    self.assertTrue(started.wait(1.0))
+                    before = float(guard.state.get("updated_at") or 0.0)
+                    deadline = time.time() + 1.0
+                    refreshed = False
+                    while time.time() < deadline:
+                        saved = json.loads(cfg.state_file.read_text(encoding="utf-8"))
+                        if float(saved.get("updated_at") or 0.0) > before:
+                            refreshed = True
+                            break
+                        time.sleep(0.02)
+                    release.set()
+                    future.result(timeout=2.0)
+            finally:
+                quality_guard.LIVENESS_INTERVAL_SECONDS = original_interval
+            self.assertTrue(refreshed)
 
     def test_hard_signal_quarantines_and_healthy_recovery_restores(self):
         with tempfile.TemporaryDirectory() as directory:

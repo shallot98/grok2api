@@ -23,9 +23,12 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any
 
+
+LIVENESS_INTERVAL_SECONDS = 15.0
 
 RUNTIME_CONFIG_FIELDS = {
     "mode",
@@ -544,6 +547,23 @@ class Guard:
         self._update_guard_metadata()
         save_state(self.config.state_file, self.state)
 
+    def _touch_liveness(self) -> None:
+        self.state["updated_at"] = time.time()
+        save_state(self.config.state_file, self.state)
+
+    def _call_with_liveness(self, func: Any, /, *args: Any, **kwargs: Any) -> Any:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(func, *args, **kwargs)
+            pending: set[Future[Any]] = {future}
+            while pending:
+                done, pending = wait(pending, timeout=LIVENESS_INTERVAL_SECONDS)
+                if not done:
+                    self._touch_liveness()
+                    pending = {future}
+                    continue
+                return future.result()
+        raise RuntimeError("liveness wait returned without a result")
+
     def _state_for(self, node_id: str) -> dict[str, Any]:
         nodes = self.state.setdefault("nodes", {})
         current = nodes.setdefault(node_id, default_node_state())
@@ -701,8 +721,9 @@ class Guard:
         if state.get("last_reason") == "probe_no_account" and now < float(state.get("quarantined_until", 0.0)):
             return
         self._bump_statistic("active", "total")
+        self._touch_liveness()
         try:
-            result = self.api.quality_test(node_id)
+            result = self._call_with_liveness(self.api.quality_test, node_id)
         except Exception as exc:
             if self._probe_account_unavailable(exc):
                 self._defer_no_account(state, node, now, "quality_probe_deferred", trigger=trigger)
@@ -760,7 +781,7 @@ class Guard:
                 connectivity_status = "error"
                 log_event("recovery_connectivity_probe_failed", node_id=node_id, node_name=node.get("name"), error_type=type(exc).__name__)
             self._bump_statistic("active", "total")
-            result = self.api.quality_test(node_id)
+            result = self._call_with_liveness(self.api.quality_test, node_id)
             classification, reason = classify_result(result, self.config)
             self._record_probe(node, result, classification, reason, now)
         except Exception as exc:
