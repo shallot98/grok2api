@@ -3,10 +3,7 @@ import json
 import stat
 import sys
 import tempfile
-import threading
-import time
 import unittest
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 
@@ -29,7 +26,6 @@ def config(**overrides):
         min_healthy_nodes=3, max_output_tokens=384, prompt="probe", expected="QUALITY_OK",
         fail_closed=False, min_generation_ms=1000, rotation_url="", rotation_token="",
         rotation_timeout_seconds=45, rotatable_node_ids=(),
-        active_concurrency=1, max_rotation_attempts=3,
         state_file=Path("/tmp/state.json"), lock_file=Path("/tmp/lock"),
         runtime_config_file=Path("/tmp/runtime-config.json"),
     )
@@ -40,16 +36,16 @@ def config(**overrides):
 class ClassificationTests(unittest.TestCase):
     def test_healthy_soft_and_hard_thresholds(self):
         cfg = config()
-        self.assertEqual(quality_guard.classify_result({"expectedMatched": True, "outputTokens": 100, "visibleTokensPerSecond": 499}, cfg)[0], "healthy")
-        self.assertEqual(quality_guard.classify_result({"expectedMatched": True, "outputTokens": 100, "visibleTokensPerSecond": 500}, cfg)[0], "soft")
-        self.assertEqual(quality_guard.classify_result({"expectedMatched": True, "outputTokens": 100, "visibleTokensPerSecond": 1000}, cfg)[0], "hard")
+        self.assertEqual(quality_guard.classify_result({"expectedMatched": True, "outputTokens": 100, "outputTokensPerSecond": 499}, cfg)[0], "healthy")
+        self.assertEqual(quality_guard.classify_result({"expectedMatched": True, "outputTokens": 100, "outputTokensPerSecond": 500}, cfg)[0], "soft")
+        self.assertEqual(quality_guard.classify_result({"expectedMatched": True, "outputTokens": 100, "outputTokensPerSecond": 1000}, cfg)[0], "hard")
 
     def test_missing_marker_and_short_response_are_soft_failures(self):
         cfg = config()
         self.assertEqual(quality_guard.classify_result({"expectedMatched": False, "outputTokens": 100, "outputTokensPerSecond": 10}, cfg), ("soft", "expected_marker_missing"))
         self.assertEqual(quality_guard.classify_result({"expectedMatched": True, "outputTokens": 12, "outputTokensPerSecond": 10}, cfg), ("soft", "insufficient_output_tokens"))
 
-    def test_passive_speed_excludes_reasoning_tokens(self):
+    def test_passive_speed_matches_panel_and_includes_reasoning_tokens(self):
         cfg = config()
         classification, reason, speed, output = quality_guard.classify_audit({
             "provider": "grok_build", "streaming": True, "statusCode": 200,
@@ -57,19 +53,7 @@ class ClassificationTests(unittest.TestCase):
             "outputTokens": 1050, "reasoningTokens": 950,
         }, cfg)
         self.assertEqual((classification, reason, output), ("hard", "hard_tps", 1050))
-        self.assertEqual(speed, 1000)
-
-    def test_reasoning_heavy_probe_uses_visible_rate(self):
-        cfg = config()
-        result = {
-            "expectedMatched": True,
-            "outputTokens": 1335,
-            "reasoningTokens": 1318,
-            "outputTokensPerSecond": 6070,
-            "visibleTokensPerSecond": 77.27,
-            "generationMs": 220,
-        }
-        self.assertEqual(quality_guard.classify_result(result, cfg), ("healthy", "within_threshold"))
+        self.assertEqual(speed, 10500)
 
     def test_passive_ignores_short_and_failed_requests(self):
         cfg = config()
@@ -194,7 +178,6 @@ class FakeApi:
         self.enabled_calls = []
         self.quality_calls = []
         self.rotation_calls = []
-        self.quarantine_account_calls = []
 
     def list_nodes(self):
         return self.nodes
@@ -202,8 +185,8 @@ class FakeApi:
     def fixed_fallback_node_ids(self):
         return set(self.fixed_fallback_ids)
 
-    def quality_test(self, node_id, account_id=""):
-        self.quality_calls.append((node_id, account_id) if account_id else node_id)
+    def quality_test(self, node_id):
+        self.quality_calls.append(node_id)
         value = self.results.pop(0)
         if isinstance(value, Exception):
             raise value
@@ -219,12 +202,6 @@ class FakeApi:
                 node["enabled"] = enabled
                 return 1
         return 0
-
-    def set_suspended(self, node_id, suspended):
-        return bool(self.set_enabled(node_id, not suspended))
-
-    def quarantine_account(self, account_id):
-        self.quarantine_account_calls.append(account_id)
 
     def rotate_node(self, node_id, old_exit_ip=""):
         self.rotation_calls.append((node_id, old_exit_ip))
@@ -265,68 +242,6 @@ class GuardTests(unittest.TestCase):
             })
             self.assertEqual(guard.state["statistics"]["actions"]["quarantined"], 1)
             self.assertEqual(guard.state["statistics"]["actions"]["restored"], 1)
-
-    def test_recovery_repairs_lost_backend_suspension_ownership(self):
-        class LostOwnershipApi(FakeApi):
-            def __init__(self, nodes, results):
-                super().__init__(nodes, results)
-                self.restore_attempted = False
-
-            def set_suspended(self, node_id, suspended):
-                if not suspended and not self.restore_attempted:
-                    self.restore_attempted = True
-                    raise quality_guard.ApiError(400, "invalidEgressNode", "ownership lost")
-                return super().set_suspended(node_id, suspended)
-
-        with tempfile.TemporaryDirectory() as directory:
-            cfg = config(
-                state_file=Path(directory) / "state.json",
-                lock_file=Path(directory) / "lock",
-                node_ids=("1",),
-            )
-            nodes = self.nodes()
-            nodes[0]["enabled"] = False
-            good = {"expectedMatched": True, "outputTokens": 100, "outputTokensPerSecond": 100}
-            api = LostOwnershipApi(nodes, [good])
-            guard = quality_guard.Guard(cfg, api)
-            state = guard._state_for("1")
-            state.update({"disabled_by_guard": True, "quarantined_until": 0})
-
-            guard.run_active_cycle()
-
-            self.assertEqual(api.enabled_calls, [("1", False), ("1", True)])
-            self.assertFalse(state["disabled_by_guard"])
-
-    def test_active_cycle_bounds_parallel_probe_fetches(self):
-        class ConcurrentApi(FakeApi):
-            def __init__(self, nodes):
-                super().__init__(nodes, [])
-                self.active = 0
-                self.max_active = 0
-                self.guard = threading.Lock()
-
-            def quality_test(self, node_id, account_id=""):
-                with self.guard:
-                    self.quality_calls.append((node_id, account_id) if account_id else node_id)
-                    self.active += 1
-                    self.max_active = max(self.max_active, self.active)
-                time.sleep(0.03)
-                with self.guard:
-                    self.active -= 1
-                return {"expectedMatched": True, "outputTokens": 100, "outputTokensPerSecond": 100}
-
-        with tempfile.TemporaryDirectory() as directory:
-            cfg = config(
-                state_file=Path(directory) / "state.json",
-                lock_file=Path(directory) / "lock",
-                node_ids=("1", "2", "3"),
-                active_concurrency=2,
-            )
-            api = ConcurrentApi(self.nodes(3))
-            guard = quality_guard.Guard(cfg, api)
-            guard.run_active_cycle()
-            self.assertEqual(sorted(api.quality_calls), ["1", "2", "3"])
-            self.assertEqual(api.max_active, 2)
 
     def test_auto_discovery_publishes_resolved_node_ids_for_status_consumers(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -471,7 +386,7 @@ class GuardTests(unittest.TestCase):
             self.assertEqual(api.enabled_calls, [])
             self.assertFalse(guard.state["nodes"]["1"]["disabled_by_guard"])
 
-    def test_fail_closed_passive_soft_signal_needs_unhealthy_active_confirmation(self):
+    def test_fail_closed_rotates_soft_signal_and_restores_after_one_good_probe(self):
         with tempfile.TemporaryDirectory() as directory:
             cfg = config(
                 state_file=Path(directory) / "state.json",
@@ -496,8 +411,8 @@ class GuardTests(unittest.TestCase):
             guard = quality_guard.Guard(cfg, api)
             guard.run_passive_cycle()
             guard.run_passive_cycle()
-            self.assertEqual(api.enabled_calls, [])
-            self.assertEqual(api.rotation_calls, [])
+            self.assertEqual(api.enabled_calls, [("1", False), ("1", True)])
+            self.assertEqual(api.rotation_calls, [("1", "")])
             self.assertEqual(api.quality_calls, ["1"])
             self.assertFalse(guard.state["nodes"]["1"]["disabled_by_guard"])
 
@@ -529,8 +444,15 @@ class GuardTests(unittest.TestCase):
             self.assertEqual(guard.state["nodes"]["1"]["error_strikes"], 1)
 
             guard.run_active_cycle()
+            self.assertEqual(api.enabled_calls, [("1", False)])
+            self.assertEqual(api.rotation_calls, [("1", "")])
+            self.assertTrue(guard.state["nodes"]["1"]["disabled_by_guard"])
+            self.assertEqual(guard.state["nodes"]["1"]["last_reason"], "recovery_probe_error")
+
+            guard.state["nodes"]["1"]["quarantined_until"] = 0
+            guard.run_active_cycle()
             self.assertEqual(api.enabled_calls, [("1", False), ("1", True)])
-            self.assertEqual(api.rotation_calls, [("1", ""), ("1", "203.0.113.10")])
+            self.assertEqual(api.rotation_calls, [("1", ""), ("1", "")])
             self.assertFalse(guard.state["nodes"]["1"]["disabled_by_guard"])
 
     def test_probe_without_schedulable_account_is_deferred_without_rotation(self):
@@ -569,7 +491,7 @@ class GuardTests(unittest.TestCase):
             self.assertTrue(state["disabled_by_guard"])
             self.assertEqual(state["quarantined_until"], recovery_at + cfg.no_account_backoff_seconds)
 
-    def test_fail_closed_buffered_burst_does_not_mutate_after_healthy_confirmation(self):
+    def test_fail_closed_buffered_burst_restores_same_ip_after_one_good_probe(self):
         with tempfile.TemporaryDirectory() as directory:
             cfg = config(
                 state_file=Path(directory) / "state.json",
@@ -592,7 +514,7 @@ class GuardTests(unittest.TestCase):
             guard = quality_guard.Guard(cfg, api)
             guard.run_passive_cycle()
             guard.run_passive_cycle()
-            self.assertEqual(api.enabled_calls, [])
+            self.assertEqual(api.enabled_calls, [("1", False), ("1", True)])
             self.assertEqual(api.rotation_calls, [])
             self.assertEqual(api.quality_calls, ["1"])
 
@@ -613,52 +535,13 @@ class GuardTests(unittest.TestCase):
                 "outputTokensPerSecond": 100,
                 "generationMs": 50,
             }
-            api = FakeApi(self.nodes(3), [ambiguous, ambiguous.copy(), ambiguous.copy(), ambiguous.copy()])
+            api = FakeApi(self.nodes(3), [ambiguous, ambiguous.copy()])
             guard = quality_guard.Guard(cfg, api)
             guard._probe_active(api.nodes, api.nodes[0], 1.0)
             self.assertEqual(api.enabled_calls, [("1", False)])
-            self.assertEqual(api.rotation_calls, [
-                ("1", ""),
-                ("1", "203.0.113.10"),
-                ("1", "203.0.113.10"),
-            ])
+            self.assertEqual(api.rotation_calls, [("1", "")])
             self.assertTrue(guard.state["nodes"]["1"]["disabled_by_guard"])
             self.assertEqual(guard.state["nodes"]["1"]["last_reason"], "insufficient_generation_window")
-
-    def test_recovery_attributes_degradation_to_account_after_healthy_sentinel(self):
-        with tempfile.TemporaryDirectory() as directory:
-            cfg = config(
-                state_file=Path(directory) / "state.json",
-                lock_file=Path(directory) / "lock",
-                node_ids=("1",),
-                min_healthy_nodes=2,
-                rotation_url="http://127.0.0.1:19099/rotate",
-                rotatable_node_ids=("1",),
-            )
-            bad_account = {
-                "expectedMatched": True,
-                "outputTokens": 100,
-                "visibleTokensPerSecond": 1200,
-                "accountId": "42",
-            }
-            good_sentinel = {
-                "expectedMatched": True,
-                "outputTokens": 100,
-                "visibleTokensPerSecond": 100,
-            }
-            api = FakeApi(self.nodes(3), [bad_account, bad_account.copy(), good_sentinel])
-            guard = quality_guard.Guard(cfg, api)
-
-            guard.run_active_cycle()
-
-            self.assertEqual(api.quality_calls, ["1", ("1", "42"), "1"])
-            self.assertEqual(api.quarantine_account_calls, ["42"])
-            self.assertEqual(api.rotation_calls, [("1", "")])
-            self.assertEqual(api.enabled_calls, [("1", False), ("1", True)])
-            state = guard.state["nodes"]["1"]
-            self.assertEqual(state["last_attribution"], "account")
-            self.assertEqual(state["last_reason"], "account_quality_degraded")
-            self.assertFalse(state["disabled_by_guard"])
 
     def test_fail_closed_manual_reenable_requires_probe(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -710,26 +593,29 @@ class GuardTests(unittest.TestCase):
             self.assertTrue(guard.state["passive_initialized"])
             self.assertIn("old", guard.state["seen_audit_ids"])
 
-    def test_passive_hard_signal_requires_active_confirmation_and_ignores_guard_key(self):
+    def test_passive_hard_signal_quarantines_immediately_and_ignores_guard_key(self):
         with tempfile.TemporaryDirectory() as directory:
             cfg = config(state_file=Path(directory) / "state.json", lock_file=Path(directory) / "lock", mode="passive", node_ids=("2",))
             healthy = {"expectedMatched": True, "outputTokens": 100, "outputTokensPerSecond": 100}
-            user_audit = self.audit("user", "2", 1200)
-            user_audit["accountId"] = "42"
             api = FakeApi(self.nodes(), [healthy], [
                 {"items": [], "hasMore": False, "nextCursor": ""},
-                {"items": [self.audit("guard", "1", 1200, quality_probe=True), user_audit], "hasMore": False, "nextCursor": ""},
+                {"items": [self.audit("guard", "1", 1200, quality_probe=True), self.audit("user", "2", 1200)], "hasMore": False, "nextCursor": ""},
             ])
             guard = quality_guard.Guard(cfg, api)
             guard.run_passive_cycle()
             guard.run_passive_cycle()
-            self.assertEqual(api.quality_calls, [("2", "42")])
-            self.assertEqual(api.enabled_calls, [])
+            self.assertEqual(api.quality_calls, [])
+            self.assertEqual(api.enabled_calls, [("2", False)])
             self.assertFalse(guard.state["nodes"].get("1", {}).get("disabled_by_guard", False))
-            self.assertFalse(guard.state["nodes"]["2"]["disabled_by_guard"])
+            self.assertTrue(guard.state["nodes"]["2"]["disabled_by_guard"])
             self.assertEqual(guard.state["nodes"]["2"]["passive_soft_strikes"], 0)
             self.assertEqual(guard.state["statistics"]["passive"]["total"], 1)
             self.assertEqual(guard.state["statistics"]["passive"]["hard"], 1)
+            guard.state["nodes"]["2"]["quarantined_until"] = 0
+            guard.run_active_cycle()
+            self.assertEqual(api.quality_calls, ["2"])
+            self.assertEqual(api.enabled_calls, [("2", False), ("2", True)])
+            self.assertFalse(guard.state["nodes"]["2"]["disabled_by_guard"])
 
     def test_passive_soft_signal_still_requires_active_confirmation(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -765,19 +651,18 @@ class GuardTests(unittest.TestCase):
             self.assertEqual(api.enabled_calls, [("2", False)])
             self.assertTrue(guard.state["nodes"]["2"]["disabled_by_guard"])
 
-    def test_multiple_passive_hard_signals_each_require_active_confirmation(self):
+    def test_multiple_passive_hard_signals_only_quarantine_once(self):
         with tempfile.TemporaryDirectory() as directory:
             cfg = config(state_file=Path(directory) / "state.json", lock_file=Path(directory) / "lock", mode="passive")
-            healthy = {"expectedMatched": True, "outputTokens": 100, "outputTokensPerSecond": 100}
-            api = FakeApi(self.nodes(), [healthy, healthy.copy()], [
+            api = FakeApi(self.nodes(), [], [
                 {"items": [], "hasMore": False, "nextCursor": ""},
                 {"items": [self.audit("user-1", "2", 1200), self.audit("user-2", "2", 1500)], "hasMore": False, "nextCursor": ""},
             ])
             guard = quality_guard.Guard(cfg, api)
             guard.run_passive_cycle()
             guard.run_passive_cycle()
-            self.assertEqual(api.quality_calls, ["2", "2"])
-            self.assertEqual(api.enabled_calls, [])
+            self.assertEqual(api.quality_calls, [])
+            self.assertEqual(api.enabled_calls, [("2", False)])
             self.assertEqual(guard.state["nodes"]["2"]["passive_soft_strikes"], 0)
 
     def test_passive_confirmation_errors_do_not_quarantine(self):
@@ -796,89 +681,6 @@ class GuardTests(unittest.TestCase):
             self.assertEqual(api.enabled_calls, [])
             self.assertEqual(guard.state["nodes"]["2"]["error_strikes"], 1)
 
-
-    def test_liveness_refreshes_during_long_active_probe(self):
-        with tempfile.TemporaryDirectory() as directory:
-            cfg = config(
-                state_file=Path(directory) / "state.json",
-                lock_file=Path(directory) / "lock",
-                mode="active",
-                node_ids=("1",),
-            )
-            release = threading.Event()
-            started = threading.Event()
-
-            class SlowApi(FakeApi):
-                def quality_test(self, node_id, account_id=""):
-                    started.set()
-                    if not release.wait(2.0):
-                        raise TimeoutError("slow probe was not released")
-                    return {"expectedMatched": True, "outputTokens": 100, "outputTokensPerSecond": 50, "generationMs": 1500}
-
-            api = SlowApi(self.nodes(1), [])
-            guard = quality_guard.Guard(cfg, api)
-            original_interval = quality_guard.LIVENESS_INTERVAL_SECONDS
-            quality_guard.LIVENESS_INTERVAL_SECONDS = 0.05
-            try:
-                with ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(guard._probe_active, api.nodes, api.nodes[0], time.time(), "scheduled")
-                    self.assertTrue(started.wait(1.0))
-                    before = float(guard.state.get("updated_at") or 0.0)
-                    deadline = time.time() + 1.0
-                    refreshed = False
-                    while time.time() < deadline:
-                        current = float(json.loads(cfg.state_file.read_text(encoding="utf-8")).get("updated_at") or 0.0)
-                        if current > before:
-                            refreshed = True
-                            break
-                        time.sleep(0.02)
-                    release.set()
-                    future.result(timeout=2.0)
-            finally:
-                quality_guard.LIVENESS_INTERVAL_SECONDS = original_interval
-            self.assertTrue(refreshed)
-
-    def test_liveness_refreshes_during_long_scheduled_cycle(self):
-        with tempfile.TemporaryDirectory() as directory:
-            cfg = config(
-                state_file=Path(directory) / "state.json",
-                lock_file=Path(directory) / "lock",
-                mode="active",
-                node_ids=("1",),
-            )
-            release = threading.Event()
-            started = threading.Event()
-
-            class SlowApi(FakeApi):
-                def quality_test(self, node_id, account_id=""):
-                    started.set()
-                    if not release.wait(2.0):
-                        raise TimeoutError("slow probe was not released")
-                    return {"expectedMatched": True, "outputTokens": 100, "outputTokensPerSecond": 50}
-
-            api = SlowApi(self.nodes(1), [])
-            guard = quality_guard.Guard(cfg, api)
-            original_interval = quality_guard.LIVENESS_INTERVAL_SECONDS
-            quality_guard.LIVENESS_INTERVAL_SECONDS = 0.05
-            try:
-                with ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(guard.run_active_cycle)
-                    self.assertTrue(started.wait(1.0))
-                    before = float(guard.state.get("updated_at") or 0.0)
-                    deadline = time.time() + 1.0
-                    refreshed = False
-                    while time.time() < deadline:
-                        saved = json.loads(cfg.state_file.read_text(encoding="utf-8"))
-                        if float(saved.get("updated_at") or 0.0) > before:
-                            refreshed = True
-                            break
-                        time.sleep(0.02)
-                    release.set()
-                    future.result(timeout=2.0)
-            finally:
-                quality_guard.LIVENESS_INTERVAL_SECONDS = original_interval
-            self.assertTrue(refreshed)
-
     @staticmethod
     def audit(audit_id, node_id, output_tps, quality_probe=False):
         generation_ms = 100
@@ -887,7 +689,7 @@ class GuardTests(unittest.TestCase):
             "id": audit_id, "requestId": f"request-{audit_id}", "qualityProbe": quality_probe,
             "provider": "grok_build", "streaming": True,
             "statusCode": 200, "firstTokenMs": 1000, "durationMs": 1000 + generation_ms,
-            "outputTokens": output_tokens, "reasoningTokens": 0,
+            "outputTokens": output_tokens, "reasoningTokens": min(100, max(0, output_tokens - 1)),
             "egressNodeId": node_id, "errorCode": None,
         }
 
