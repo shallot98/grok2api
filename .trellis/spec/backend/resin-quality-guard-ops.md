@@ -75,6 +75,15 @@
   passive confirmation, replacement verification, and sentinel attribution,
   must refresh `updated_at` while pending without changing probe results or
   guard metadata.
+- Upstream sidecar replacements must preserve the full cross-layer contract:
+  visible-token classification, same-account passive confirmation, quality
+  suspension, model-scoped account cooldown, sentinel attribution, and bounded
+  distinct-IP retries. Passing a reduced upstream test suite is not evidence
+  that these local contracts remain intact.
+- The sidecar script is bind-mounted into the container. If an update replaces
+  the host file inode (for example, Git restore/revert), restart/recreate the
+  sidecar and verify the host and container script checksums match before
+  treating the source change as deployed.
 
 ### 4. Validation & Error Matrix
 
@@ -97,6 +106,8 @@
 | Staged reconciliation succeeds | Finalize desired-only subscription content; all main/qg tags must be desired tags |
 | Model probe remains pending for more than 60 seconds | Refresh `updated_at` at most every 15 seconds; keep the sidecar status fresh |
 | Model probe raises or completes | Preserve the original exception/result after heartbeat updates |
+| Upstream sidecar update removes account pinning, suspension, sentinel attribution, or bounded retries | Reject the update; restore the local contract and its regression tests |
+| Host and container sidecar script checksums differ after an update | Recreate the sidecar container before runtime acceptance |
 
 ### 5. Good/Base/Bad Cases
 
@@ -143,6 +154,11 @@
   and writes desired-only last; reconciliation failure performs no final write.
 - Sidecar regression: a blocked single probe and a blocked scheduled concurrent
   cycle both advance persisted `updated_at` before the request completes.
+- Sidecar regression: a passive hard anomaly runs a pinned active confirmation
+  and performs no suspension or rotation when that confirmation is healthy.
+- Deployment: after replacing the mounted script, assert `sha256sum` matches on
+  the host and at `/usr/local/bin/grok2api-egress-quality-guard` in the running
+  sidecar.
 
 ### 7. Wrong vs Correct
 
@@ -163,3 +179,6 @@ finalize only after exact desired-tag reconciliation succeeds.
 Keep the persisted sidecar heartbeat advancing during every blocking model
 request so status freshness represents process liveness rather than probe
 latency.
+Do not replace this sidecar with an upstream variant that disables nodes from
+passive evidence or bypasses the persisted quality-suspension and account
+attribution APIs, even if its narrower unit tests pass.
