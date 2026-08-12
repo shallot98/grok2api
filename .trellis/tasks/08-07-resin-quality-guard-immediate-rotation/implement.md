@@ -154,6 +154,6 @@ GitHub Actions and replaced before runtime acceptance.
 
 ## Execution gates after start
 
-- [ ] Capture baseline backups and exact rollback commands before any mutation.
+- [x] Capture baseline backups and exact rollback commands before any mutation.
 - [x] Complete 10-node canary acceptance before expanding to 30 nodes.
 - [ ] Complete 30-node acceptance before expanding to 50 nodes.

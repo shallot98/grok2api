@@ -84,6 +84,15 @@
   the host file inode (for example, Git restore/revert), restart/recreate the
   sidecar and verify the host and container script checksums match before
   treating the source change as deployed.
+- New `resin-qg-*` nodes must be created disabled. The ordinary admin
+  connectivity probe persists health and may enable a healthy node, so it is
+  forbidden during pre-provisioning. Validate the exact one-tag/one-routable-IP
+  Resin platform first, then run only the forced real-model probe and re-read
+  the node to prove it remained disabled.
+- A staged capacity expansion claims candidates under the shared maintainer
+  lock, then releases the lock before slow model probes. It must leave at least
+  20 reserve entries available to the live rotator and must not hold immediate
+  recovery behind multi-minute provisioning work.
 
 ### 4. Validation & Error Matrix
 
@@ -108,6 +117,8 @@
 | Model probe raises or completes | Preserve the original exception/result after heartbeat updates |
 | Upstream sidecar update removes account pinning, suspension, sentinel attribution, or bounded retries | Reject the update; restore the local contract and its regression tests |
 | Host and container sidecar script checksums differ after an update | Recreate the sidecar container before runtime acceptance |
+| Pre-provisioning probe changes a new node to enabled | Disable it immediately, abort the stage, rebalance any assigned accounts, and use the manifest to remove created nodes/platforms |
+| Claiming expansion candidates would leave fewer than 20 reserve IPs | Abort before writing reserve state or creating platforms |
 
 ### 5. Good/Base/Bad Cases
 
@@ -159,6 +170,10 @@
 - Deployment: after replacing the mounted script, assert `sha256sum` matches on
   the host and at `/usr/local/bin/grok2api-egress-quality-guard` in the running
   sidecar.
+- Provisioning: `provision_resin_qg.py` defaults to a read-only plan; `--apply`
+  requires a new private backup directory and writes `provision-manifest.json`
+  after every created platform/node. Test empty DELETE responses, partial
+  manifests, reserve-floor failure, and unexpected node enablement.
 
 ### 7. Wrong vs Correct
 
