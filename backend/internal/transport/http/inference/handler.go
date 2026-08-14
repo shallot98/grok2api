@@ -1787,6 +1787,8 @@ func selectionErrorResponse(c *gin.Context, failure *gateway.SelectionUnavailabl
 			message = "上游账号额度等待恢复"
 		case gateway.SelectionSaturated:
 			message = "上游账号当前均达到并发上限"
+		case gateway.SelectionEgressWindowFull:
+			message = "出口账号窗口容量已满"
 		case gateway.SelectionUnsupportedModel:
 			message = "当前账号池不支持该模型"
 		}

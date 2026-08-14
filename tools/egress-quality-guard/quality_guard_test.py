@@ -70,11 +70,11 @@ class ClassificationTests(unittest.TestCase):
         }
         self.assertEqual(quality_guard.classify_result(result, cfg), ("healthy", "within_threshold"))
 
-    def test_passive_ignores_short_and_failed_requests(self):
+    def test_passive_treats_short_response_as_soft_and_ignores_failed_request(self):
         cfg = config()
         short = {"provider": "grok_build", "streaming": True, "statusCode": 200, "firstTokenMs": 100, "durationMs": 110, "outputTokens": 20, "reasoningTokens": 0}
         failed = {**short, "statusCode": 502, "outputTokens": 100}
-        self.assertEqual(quality_guard.classify_audit(short, cfg)[0], "ignored")
+        self.assertEqual(quality_guard.classify_audit(short, cfg)[:2], ("soft", "insufficient_output_tokens"))
         self.assertEqual(quality_guard.classify_audit(failed, cfg)[0], "ignored")
 
 
@@ -652,12 +652,65 @@ class GuardTests(unittest.TestCase):
 
             self.assertEqual(api.quality_calls, ["1", ("1", "42"), "1"])
             self.assertEqual(api.quarantine_account_calls, ["42"])
-            self.assertEqual(api.rotation_calls, [("1", "")])
+            self.assertEqual(api.rotation_calls, [])
             self.assertEqual(api.enabled_calls, [("1", False), ("1", True)])
             state = guard.state["nodes"]["1"]
             self.assertEqual(state["last_attribution"], "account")
             self.assertEqual(state["last_reason"], "account_quality_degraded")
             self.assertFalse(state["disabled_by_guard"])
+
+    def test_short_responses_require_two_confirmations_from_the_same_account(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = config(
+                state_file=Path(directory) / "state.json",
+                lock_file=Path(directory) / "lock",
+                mode="passive",
+            )
+            short_a = self.audit("short-a", "2", 10)
+            short_a.update({"accountId": "42", "outputTokens": 20})
+            short_b = self.audit("short-b", "2", 10)
+            short_b.update({"accountId": "43", "outputTokens": 20})
+            degraded = {"expectedMatched": True, "outputTokens": 20, "outputTokensPerSecond": 10}
+            api = FakeApi(self.nodes(), [degraded, degraded.copy()], [
+                {"items": [], "hasMore": False, "nextCursor": ""},
+                {"items": [short_a, short_b], "hasMore": False, "nextCursor": ""},
+            ])
+            guard = quality_guard.Guard(cfg, api)
+
+            guard.run_passive_cycle()
+            guard.run_passive_cycle()
+
+            self.assertCountEqual(api.quality_calls, [("2", "42"), ("2", "43")])
+            self.assertEqual(api.quarantine_account_calls, [])
+            self.assertEqual(guard.state["nodes"]["2"]["account_soft_strikes"], {"42": 1, "43": 1})
+
+    def test_repeated_short_response_quarantines_account_without_rotation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = config(
+                state_file=Path(directory) / "state.json", lock_file=Path(directory) / "lock",
+                mode="passive", rotation_url="http://127.0.0.1:19099/rotate", rotatable_node_ids=("2",),
+            )
+            first = self.audit("short-1", "2", 10)
+            first.update({"accountId": "42", "outputTokens": 20})
+            second = self.audit("short-2", "2", 10)
+            second.update({"accountId": "42", "outputTokens": 20})
+            degraded = {"expectedMatched": True, "outputTokens": 20, "outputTokensPerSecond": 10, "accountId": "42"}
+            healthy = {"expectedMatched": True, "outputTokens": 100, "outputTokensPerSecond": 100}
+            api = FakeApi(self.nodes(), [degraded, degraded.copy(), degraded.copy(), healthy], [
+                {"items": [], "hasMore": False, "nextCursor": ""},
+                {"items": [first], "hasMore": False, "nextCursor": ""},
+                {"items": [second], "hasMore": False, "nextCursor": ""},
+            ])
+            guard = quality_guard.Guard(cfg, api)
+
+            guard.run_passive_cycle()
+            guard.run_passive_cycle()
+            guard.run_passive_cycle()
+
+            self.assertEqual(api.quarantine_account_calls, ["42"])
+            self.assertEqual(api.rotation_calls, [])
+            self.assertFalse(guard.state["nodes"]["2"]["disabled_by_guard"])
+            self.assertEqual(guard.state["nodes"]["2"]["last_attribution"], "account")
 
     def test_fail_closed_manual_reenable_requires_probe(self):
         with tempfile.TemporaryDirectory() as directory:

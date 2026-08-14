@@ -388,6 +388,21 @@ func TestValidateRejectsInvalidSegmentedSelectorConfig(t *testing.T) {
 	}
 }
 
+func TestValidateEgressAccountWindowConfig(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Secrets.JWTSecret = "12345678901234567890123456789012"
+	cfg.Secrets.CredentialEncryptionKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+	cfg.Routing.EgressAccountWindow = Duration(10 * time.Minute)
+	cfg.Routing.EgressMaxDistinctAccounts = 4
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("valid egress account window rejected: %v", err)
+	}
+	cfg.Routing.EgressMaxDistinctAccounts = 0
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("partially configured egress account window should be rejected")
+	}
+}
+
 func TestLoadRejectsMediaRuntimeSettingsInYAML(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	data := []byte(`secrets:

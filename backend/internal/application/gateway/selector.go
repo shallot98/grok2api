@@ -142,6 +142,7 @@ const (
 	SelectionModelCooling     SelectionUnavailableReason = "model_cooling"
 	SelectionQuotaExhausted   SelectionUnavailableReason = "quota_exhausted"
 	SelectionSaturated        SelectionUnavailableReason = "saturated"
+	SelectionEgressWindowFull SelectionUnavailableReason = "egress_account_window_full"
 )
 
 // SelectionUnavailableError 保留选号失败的真实原因，避免所有情况都退化成模糊的 503。
@@ -185,6 +186,8 @@ func (e *SelectionUnavailableError) Error() string {
 			return prefix + "中的可用账号均达到并发上限"
 		}
 		return "可用上游账号均达到并发上限"
+	case SelectionEgressWindowFull:
+		return "出口在滑动窗口内使用的不同账号数已达上限"
 	default:
 		if prefix != "" {
 			return prefix + "当前没有可用上游账号"
@@ -197,7 +200,7 @@ func (e *SelectionUnavailableError) Error() string {
 func (e *SelectionUnavailableError) HTTPStatus() int {
 	if e != nil {
 		switch e.Reason {
-		case SelectionCooling, SelectionModelCooling, SelectionQuotaExhausted:
+		case SelectionCooling, SelectionModelCooling, SelectionQuotaExhausted, SelectionEgressWindowFull:
 			return http.StatusTooManyRequests
 		}
 	}
@@ -216,6 +219,8 @@ func (e *SelectionUnavailableError) Code() string {
 			return "upstream_quota_exhausted"
 		case SelectionSaturated:
 			return "upstream_saturated"
+		case SelectionEgressWindowFull:
+			return "egress_account_window_full"
 		case SelectionUnsupportedModel:
 			return "upstream_model_unavailable"
 		case SelectionNoAccounts:
@@ -270,6 +275,7 @@ type Selector struct {
 	quotaMu                sync.RWMutex
 	staleLogMu             sync.Mutex
 	qualityNodeMu          sync.RWMutex
+	egressAccountWindow    egressAccountWindow
 	logger                 *slog.Logger
 	leaseWakeMu            sync.Mutex
 	leaseWake              chan struct{}
@@ -361,6 +367,10 @@ func (s *Selector) UpdateSegmentedSelector(enabled bool, minCandidates, windowSi
 	s.configMu.Unlock()
 }
 
+func (s *Selector) UpdateEgressAccountWindow(duration time.Duration, maxDistinct int) {
+	s.egressAccountWindow.update(duration, maxDistinct)
+}
+
 func (s *Selector) routingConfig() (time.Duration, time.Duration, time.Duration, time.Duration) {
 	s.configMu.RLock()
 	defer s.configMu.RUnlock()
@@ -422,6 +432,7 @@ func (s *Selector) acquire(ctx context.Context, provider account.Provider, model
 	coolingCandidates := 0
 	modelCoolingCandidates := 0
 	quotaCandidates := 0
+	egressWindowCandidates := 0
 	var earliestRetry time.Time
 	for index, candidate := range values {
 		value := candidate.Credential
@@ -475,6 +486,11 @@ func (s *Selector) acquire(ctx context.Context, provider account.Provider, model
 			}
 			continue
 		}
+		if allowed, retry := s.egressAccountWindow.allows(value, now); !allowed {
+			egressWindowCandidates++
+			earliestRetry = earlierFuture(earliestRetry, now.Add(retry), now)
+			continue
+		}
 		normalCandidates = append(normalCandidates, index)
 	}
 	if len(normalCandidates) == 0 && len(probeCandidates) == 0 {
@@ -488,6 +504,8 @@ func (s *Selector) acquire(ctx context.Context, provider account.Provider, model
 			reason = SelectionCooling
 		case quotaCandidates > 0:
 			reason = SelectionQuotaExhausted
+		case egressWindowCandidates > 0:
+			reason = SelectionEgressWindowFull
 		}
 		return nil, &SelectionUnavailableError{Reason: reason, RetryAfter: retryDelay(now, earliestRetry)}
 	}
@@ -1720,6 +1738,10 @@ func (s *Selector) claimAccountSlot(ctx context.Context, value account.Credentia
 			return nil, errRoutingCredentialStale
 		}
 		value = hydrated
+	}
+	if !s.egressAccountWindow.record(value, time.Now().UTC()) {
+		releaseSlot()
+		return nil, nil
 	}
 	s.selectionMu.Lock()
 	s.lastSelectedAt[value.ID] = time.Now().UTC()

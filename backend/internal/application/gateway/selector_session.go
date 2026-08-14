@@ -63,6 +63,7 @@ func (s *Selector) beginSelectionSessionForKey(ctx context.Context, provider acc
 	coolingCandidates := 0
 	modelCoolingCandidates := 0
 	quotaCandidates := 0
+	egressWindowCandidates := 0
 	var earliestRetry time.Time
 
 	for index, candidate := range values {
@@ -113,6 +114,11 @@ func (s *Selector) beginSelectionSessionForKey(ctx context.Context, provider acc
 			}
 			continue
 		}
+		if allowed, retry := s.egressAccountWindow.allows(value, now); !allowed {
+			egressWindowCandidates++
+			earliestRetry = earlierFuture(earliestRetry, now.Add(retry), now)
+			continue
+		}
 		session.normalCandidates = append(session.normalCandidates, index)
 	}
 
@@ -129,6 +135,8 @@ func (s *Selector) beginSelectionSessionForKey(ctx context.Context, provider acc
 		reason = SelectionCooling
 	case quotaCandidates > 0 || len(session.probeCandidates) > 0:
 		reason = SelectionQuotaExhausted
+	case egressWindowCandidates > 0:
+		reason = SelectionEgressWindowFull
 	}
 	return nil, &SelectionUnavailableError{Reason: reason, RetryAfter: retryDelay(now, earliestRetry), Scope: accountScope}
 }

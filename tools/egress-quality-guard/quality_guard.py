@@ -44,6 +44,7 @@ RUNTIME_CONFIG_FIELDS = {
 BOOTSTRAP_VERSION = 1
 BOOTSTRAP_FILE = Path("/var/lib/grok2api-quality-guard/bootstrap.json")
 INTERNAL_API_PREFIX = "/api/internal/v1/quality-guard"
+MIN_QUALITY_OUTPUT_TOKENS = 32
 
 
 class GuardDisabled(RuntimeError):
@@ -387,7 +388,7 @@ def classify_result(result: dict[str, Any], config: Config) -> tuple[str, str]:
     generation_ms = int(result.get("generationMs") or 0)
     if generation_ms <= 0:
         generation_ms = max(0, int(result.get("durationMs") or 0) - int(result.get("firstTokenMs") or 0))
-    if output_tokens < 32:
+    if output_tokens < MIN_QUALITY_OUTPUT_TOKENS:
         return "soft", "insufficient_output_tokens"
     if config.fail_closed and generation_ms < config.min_generation_ms:
         return "soft", "insufficient_generation_window"
@@ -411,8 +412,10 @@ def classify_audit(value: dict[str, Any], config: Config) -> tuple[str, str, flo
     output_tokens = max(0, int(value.get("outputTokens") or 0))
     reasoning_tokens = max(0, int(value.get("reasoningTokens") or 0))
     visible_tokens = max(0, output_tokens - reasoning_tokens)
-    if generation_ms <= 0 or output_tokens < 32:
-        return "ignored", "insufficient_output_tokens", 0.0, output_tokens
+    if generation_ms <= 0:
+        return "ignored", "invalid_generation_window", 0.0, output_tokens
+    if output_tokens < MIN_QUALITY_OUTPUT_TOKENS:
+        return "soft", "insufficient_output_tokens", 0.0, output_tokens
     speed = float(visible_tokens) * 1000 / float(generation_ms)
     if config.fail_closed and generation_ms < config.min_generation_ms and speed >= config.soft_tps:
         return "hard", "buffered_burst", speed, output_tokens
@@ -427,6 +430,7 @@ def default_node_state() -> dict[str, Any]:
     return {
         "active_soft_strikes": 0,
         "passive_soft_strikes": 0,
+        "account_soft_strikes": {},
         "error_strikes": 0,
         "quarantined_until": 0.0,
         "disabled_by_guard": False,
@@ -702,6 +706,8 @@ class Guard:
         log_event("node_quarantined", node_id=node_id, node_name=node.get("name"), reason=reason, quarantine_seconds=self.config.quarantine_seconds)
         if reason == "buffered_burst":
             self._recover_quarantined(node, time.time(), rotate=False, rotate_on_failure=True)
+        elif account_id:
+            self._recover_quarantined(node, time.time(), rotate=False, rotate_on_failure=True)
         elif self._should_rotate(node_id, reason):
             self._recover_quarantined(node, time.time(), rotate=True)
 
@@ -726,13 +732,6 @@ class Guard:
         state["error_strikes"] = 0
         self._bump_statistic("active", classification)
         self._bump_statistic("active", "output_tokens", output_tokens)
-        if classification == "healthy":
-            state["active_soft_strikes"] = 0
-            state["passive_soft_strikes"] = 0
-        elif classification == "soft":
-            state["active_soft_strikes"] = int(state.get("active_soft_strikes", 0)) + 1
-        else:
-            state["active_soft_strikes"] = self.config.consecutive_soft
         log_event(
             "quality_probe_completed",
             node_id=node_id,
@@ -747,6 +746,25 @@ class Guard:
             expected_matched=bool(result.get("expectedMatched")),
             account_id=result.get("accountId"),
         )
+
+    def _record_probe_strike(self, state: dict[str, Any], classification: str, account_id: str) -> int:
+        if classification == "healthy":
+            state["passive_soft_strikes"] = 0
+        if account_id:
+            strikes = state.setdefault("account_soft_strikes", {})
+            if classification == "healthy":
+                strikes.pop(account_id, None)
+                return 0
+            increment = 1 if classification == "soft" else self.config.consecutive_soft
+            strikes[account_id] = int(strikes.get(account_id, 0)) + increment
+            return int(strikes[account_id])
+        if classification == "healthy":
+            state["active_soft_strikes"] = 0
+        elif classification == "soft":
+            state["active_soft_strikes"] = int(state.get("active_soft_strikes", 0)) + 1
+        else:
+            state["active_soft_strikes"] = self.config.consecutive_soft
+        return int(state.get("active_soft_strikes", 0))
 
     def _apply_active_probe(
         self,
@@ -775,14 +793,16 @@ class Guard:
                 self._quarantine(nodes, node, "probe_errors", now)
             return
         result = outcome
+        requested_account_id = account_id
         account_id = str(result.get("accountId") or account_id)
         if account_id == "0":
             account_id = ""
         classification, reason = classify_result(result, self.config)
         self._record_probe(node, result, classification, reason, now)
+        strike_count = self._record_probe_strike(state, classification, requested_account_id)
         if classification == "hard" or (
             classification == "soft" and self.config.fail_closed
-        ) or int(state.get("active_soft_strikes", 0)) >= self.config.consecutive_soft:
+        ) or strike_count >= self.config.consecutive_soft:
             self._quarantine(nodes, node, reason, now, account_id)
 
     def _probe_active(
@@ -929,6 +949,7 @@ class Guard:
                 if sentinel_classification == "healthy":
                     state["last_attribution"] = "account"
                     state["last_reason"] = "account_quality_degraded"
+                    state.setdefault("account_soft_strikes", {}).pop(affected_account_id, None)
                     changed = self._restore_suspended(node_id)
                     if not changed:
                         log_event("restore_not_applied", node_id=node_id, node_name=node.get("name"))

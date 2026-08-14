@@ -30,6 +30,7 @@ func TestSelectionUnavailableErrorClassification(t *testing.T) {
 		{reason: SelectionModelCooling, status: http.StatusTooManyRequests, code: "upstream_model_cooling"},
 		{reason: SelectionQuotaExhausted, status: http.StatusTooManyRequests, code: "upstream_quota_exhausted"},
 		{reason: SelectionSaturated, status: http.StatusServiceUnavailable, code: "upstream_saturated"},
+		{reason: SelectionEgressWindowFull, status: http.StatusTooManyRequests, code: "egress_account_window_full"},
 	}
 	for _, test := range tests {
 		t.Run(string(test.reason), func(t *testing.T) {

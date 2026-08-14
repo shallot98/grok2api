@@ -213,12 +213,14 @@ type LocalMediaConfig struct {
 }
 
 type RoutingConfig struct {
-	StickyTTL       Duration `yaml:"stickyTTL"`
-	CooldownBase    Duration `yaml:"cooldownBase"`
-	CooldownMax     Duration `yaml:"cooldownMax"`
-	CapacityWait    Duration `yaml:"capacityWait"`
-	MaxAttempts     int      `yaml:"maxAttempts"`
-	PreferFreeBuild bool     `yaml:"preferFreeBuild"`
+	StickyTTL                 Duration `yaml:"stickyTTL"`
+	CooldownBase              Duration `yaml:"cooldownBase"`
+	CooldownMax               Duration `yaml:"cooldownMax"`
+	CapacityWait              Duration `yaml:"capacityWait"`
+	MaxAttempts               int      `yaml:"maxAttempts"`
+	PreferFreeBuild           bool     `yaml:"preferFreeBuild"`
+	EgressAccountWindow       Duration `yaml:"egressAccountWindow"`
+	EgressMaxDistinctAccounts int      `yaml:"egressMaxDistinctAccounts"`
 	// MarkBuildChatDeniedAsReauth 为 true 时，Build chat 权限拒绝标 reauthRequired，默认 false。
 	MarkBuildChatDeniedAsReauth bool     `yaml:"markBuildChatDeniedAsReauth"`
 	AccountIsolatedConnections  bool     `yaml:"accountIsolatedConnections"`
@@ -628,6 +630,10 @@ func (c Config) Validate() error {
 		c.Routing.SegmentedWindowSize > c.Routing.SegmentedMinCandidates {
 		return errors.New("routing segmented selector 配置无效")
 	}
+	windowEnabled := c.Routing.EgressAccountWindow.Value() != 0 || c.Routing.EgressMaxDistinctAccounts != 0
+	if windowEnabled && (c.Routing.EgressAccountWindow.Value() < time.Minute || c.Routing.EgressAccountWindow.Value() > time.Hour || c.Routing.EgressMaxDistinctAccounts < 1 || c.Routing.EgressMaxDistinctAccounts > 100) {
+		return errors.New("routing 出口账号窗口配置无效")
+	}
 	if c.Routing.ReasoningReplayTTL.Value() <= 0 || c.Routing.ReasoningReplayTTL.Value() > 24*time.Hour {
 		return errors.New("routing.reasoningReplayTTL 必须在 1 纳秒到 24 小时之间")
 	}
@@ -870,6 +876,8 @@ func defaultConfig() Config {
 			CooldownMax:                 Duration(30 * time.Minute),
 			CapacityWait:                Duration(500 * time.Millisecond),
 			MaxAttempts:                 999,
+			EgressAccountWindow:         0,
+			EgressMaxDistinctAccounts:   0,
 			MarkBuildChatDeniedAsReauth: false,
 			PreferFreeBuild:             false,
 			AccountIsolatedConnections:  false,
