@@ -15,6 +15,9 @@ services:
       - "${GROK2API_CONFIG:-./config.yaml}:/run/grok2api/config.yaml:ro"
       - grok2api-data:/app/data
       - quality_guard_state:/var/lib/grok2api-quality-guard
+    networks:
+      - default
+      - resin
     restart: unless-stopped
     init: true
     stop_grace_period: 30s
@@ -67,6 +70,7 @@ services:
         condition: service_healthy
     volumes:
       - quality_guard_state:/var/lib/grok2api-quality-guard
+      - ./tools/egress-quality-guard/quality_guard.py:/usr/local/bin/grok2api-egress-quality-guard:ro
     restart: "on-failure:5"
     init: true
     stop_grace_period: 30s
@@ -76,3 +80,8 @@ services:
 volumes:
   grok2api-data:
   quality_guard_state:
+
+networks:
+  resin:
+    external: true
+    name: resin_default
