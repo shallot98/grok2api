@@ -197,7 +197,13 @@ func (r *EgressRepository) UpdateEgressNodeClearance(ctx context.Context, id uin
 
 func (r *EgressRepository) UpdateEgressNodeHealth(ctx context.Context, id uint64, health float64, failureCount int, cooldownUntil *time.Time, lastError string) error {
 	result := r.db.db.WithContext(ctx).Model(&egressNodeModel{}).Where("id = ?", id).Updates(map[string]any{
-		"health": health, "failure_count": failureCount, "cooldown_until": cooldownUntil, "last_error": lastError, "updated_at": time.Now().UTC(),
+		"health": health, "failure_count": failureCount, "cooldown_until": cooldownUntil,
+		"last_error": gorm.Expr(
+			"CASE WHEN last_error = ? THEN last_error ELSE ? END",
+			egress.LastErrorQualityGuardSuspended,
+			lastError,
+		),
+		"updated_at": time.Now().UTC(),
 	})
 	if result.Error != nil {
 		return result.Error

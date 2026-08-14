@@ -392,6 +392,8 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 		MarkBuildChatDeniedAsReauth: value.Routing.MarkBuildChatDeniedAsReauth,
 		PreferFreeBuild:             value.Routing.PreferFreeBuild,
 		AccountIsolatedConnections:  accountIsolatedConnections,
+		EgressAccountWindow:         base.Routing.EgressAccountWindow,
+		EgressMaxDistinctAccounts:   base.Routing.EgressMaxDistinctAccounts,
 		SegmentedSelectorEnabled:    segmentedEnabled,
 		SegmentedMinCandidates:      segmentedMinCandidates,
 		SegmentedWindowSize:         segmentedWindowSize,

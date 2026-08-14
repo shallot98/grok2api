@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -138,6 +139,8 @@ type AuthConfig struct {
 	AccessTokenTTL  Duration `yaml:"accessTokenTTL"`
 	RefreshTokenTTL Duration `yaml:"refreshTokenTTL"`
 	SecureCookies   bool     `yaml:"secureCookies"`
+	TrustedLoginIPs []string `yaml:"trustedLoginIPs"`
+	TrustedProxies  []string `yaml:"trustedProxies"`
 }
 
 type ProviderConfig struct {
@@ -210,12 +213,14 @@ type LocalMediaConfig struct {
 }
 
 type RoutingConfig struct {
-	StickyTTL       Duration `yaml:"stickyTTL"`
-	CooldownBase    Duration `yaml:"cooldownBase"`
-	CooldownMax     Duration `yaml:"cooldownMax"`
-	CapacityWait    Duration `yaml:"capacityWait"`
-	MaxAttempts     int      `yaml:"maxAttempts"`
-	PreferFreeBuild bool     `yaml:"preferFreeBuild"`
+	StickyTTL                 Duration `yaml:"stickyTTL"`
+	CooldownBase              Duration `yaml:"cooldownBase"`
+	CooldownMax               Duration `yaml:"cooldownMax"`
+	CapacityWait              Duration `yaml:"capacityWait"`
+	MaxAttempts               int      `yaml:"maxAttempts"`
+	PreferFreeBuild           bool     `yaml:"preferFreeBuild"`
+	EgressAccountWindow       Duration `yaml:"egressAccountWindow"`
+	EgressMaxDistinctAccounts int      `yaml:"egressMaxDistinctAccounts"`
 	// MarkBuildChatDeniedAsReauth 为 true 时，Build chat 权限拒绝标 reauthRequired，默认 false。
 	MarkBuildChatDeniedAsReauth bool     `yaml:"markBuildChatDeniedAsReauth"`
 	AccountIsolatedConnections  bool     `yaml:"accountIsolatedConnections"`
@@ -530,6 +535,12 @@ func (c Config) Validate() error {
 	if c.Auth.AccessTokenTTL.Value() <= 0 || c.Auth.RefreshTokenTTL.Value() <= 0 {
 		return errors.New("JWT 有效期必须大于零")
 	}
+	if err := validateTrustedLoginIPs(c.Auth.TrustedLoginIPs); err != nil {
+		return err
+	}
+	if err := validateTrustedProxies(c.Auth.TrustedProxies); err != nil {
+		return err
+	}
 	if err := validateAPIBaseURL("provider.build.baseURL", c.Provider.Build.BaseURL, false); err != nil {
 		return err
 	}
@@ -621,6 +632,10 @@ func (c Config) Validate() error {
 		c.Routing.SegmentedWindowSize < 8 || c.Routing.SegmentedWindowSize > 256 ||
 		c.Routing.SegmentedWindowSize > c.Routing.SegmentedMinCandidates {
 		return errors.New("routing segmented selector 配置无效")
+	}
+	windowEnabled := c.Routing.EgressAccountWindow.Value() != 0 || c.Routing.EgressMaxDistinctAccounts != 0
+	if windowEnabled && (c.Routing.EgressAccountWindow.Value() < time.Minute || c.Routing.EgressAccountWindow.Value() > time.Hour || c.Routing.EgressMaxDistinctAccounts < 1 || c.Routing.EgressMaxDistinctAccounts > 100) {
+		return errors.New("routing 出口账号窗口配置无效")
 	}
 	if c.Routing.ReasoningReplayTTL.Value() <= 0 || c.Routing.ReasoningReplayTTL.Value() > 24*time.Hour {
 		return errors.New("routing.reasoningReplayTTL 必须在 1 纳秒到 24 小时之间")
@@ -738,6 +753,45 @@ func validUniquePositiveIDs(values []uint64) bool {
 	return true
 }
 
+func validateTrustedLoginIPs(values []string) error {
+	seen := make(map[string]struct{}, len(values))
+	for _, raw := range values {
+		value := strings.TrimSpace(raw)
+		if value == "" {
+			return errors.New("auth.trustedLoginIPs 不能包含空项")
+		}
+		ip := net.ParseIP(value)
+		if ip == nil {
+			return fmt.Errorf("auth.trustedLoginIPs 含有无效 IP: %s", value)
+		}
+		key := ip.String()
+		if _, exists := seen[key]; exists {
+			return fmt.Errorf("auth.trustedLoginIPs 含有重复 IP: %s", value)
+		}
+		seen[key] = struct{}{}
+	}
+	return nil
+}
+
+func validateTrustedProxies(values []string) error {
+	for _, raw := range values {
+		value := strings.TrimSpace(raw)
+		if value == "" {
+			return errors.New("auth.trustedProxies 不能包含空项")
+		}
+		if strings.Contains(value, "/") {
+			if _, _, err := net.ParseCIDR(value); err != nil {
+				return fmt.Errorf("auth.trustedProxies 含有无效 CIDR: %s", value)
+			}
+			continue
+		}
+		if net.ParseIP(value) == nil {
+			return fmt.Errorf("auth.trustedProxies 含有无效 IP: %s", value)
+		}
+	}
+	return nil
+}
+
 // validateAPIBaseURL 仅允许无凭据、query、fragment 的 HTTP(S) API 根地址。
 // requireHTTPS 为 true 时强制 HTTPS（用于生产默认 XAI 备用地址）。
 func validateAPIBaseURL(name, raw string, requireHTTPS bool) error {
@@ -825,6 +879,8 @@ func defaultConfig() Config {
 			CooldownMax:                 Duration(30 * time.Minute),
 			CapacityWait:                Duration(500 * time.Millisecond),
 			MaxAttempts:                 999,
+			EgressAccountWindow:         0,
+			EgressMaxDistinctAccounts:   0,
 			MarkBuildChatDeniedAsReauth: false,
 			PreferFreeBuild:             false,
 			AccountIsolatedConnections:  false,
