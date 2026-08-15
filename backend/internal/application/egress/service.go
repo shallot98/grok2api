@@ -30,7 +30,6 @@ const (
 	DefaultQualityProbePrompt          = "Reply with exactly QUALITY_OK."
 	DefaultQualityProbeExpected        = "QUALITY_OK"
 	DefaultQualityProbeMaxOutputTokens = 64
-	DefaultQualityAccountCooldown      = 15 * time.Minute
 	MaxQualityProbePromptBytes         = 4096
 	MaxQualityProbeExpectedBytes       = 512
 	MaxQualityProbeOutputTokens        = 2048
@@ -38,43 +37,33 @@ const (
 
 type QualityProbeInput struct {
 	ClientKeyID     uint64
-	AccountID       uint64
 	Model           string
 	Prompt          string
 	Expected        string
+	MatchMode       string
 	MaxOutputTokens int
 }
 
 type QualityProbeResult struct {
-	RequestID              string
-	NodeID                 uint64
-	AccountID              uint64
-	Model                  string
-	StatusCode             int
-	FirstTokenMS           int64
-	DurationMS             int64
-	GenerationMS           int64
-	ChunkCount             int
-	OutputTokens           int64
-	ReasoningTokens        int64
-	VisibleTokens          int64
-	VisibleCharacters      int
-	OutputTokensPerSecond  float64
-	VisibleTokensPerSecond float64
-	ExpectedMatched        bool
-	ResponseSHA256         string
+	RequestID             string
+	NodeID                uint64
+	Model                 string
+	StatusCode            int
+	FirstTokenMS          int64
+	DurationMS            int64
+	GenerationMS          int64
+	ChunkCount            int
+	OutputTokens          int64
+	ReasoningTokens       int64
+	VisibleTokens         int64
+	VisibleCharacters     int
+	OutputTokensPerSecond float64
+	ExpectedMatched       bool
+	ResponseSHA256        string
 }
 
 type QualityProber interface {
 	ProbeEgressQuality(context.Context, uint64, QualityProbeInput) (QualityProbeResult, error)
-}
-
-type QualityAccountQuarantiner interface {
-	QuarantineQualityAccount(context.Context, uint64, string, time.Duration) error
-}
-
-type QualityNodeController interface {
-	SetQualityNodeSuspended(uint64, bool)
 }
 
 const (
@@ -111,84 +100,25 @@ type ServiceRepository interface {
 }
 
 type Service struct {
-	repository            ServiceRepository
-	accounts              AccountBindingRepository
-	operations            OperationsRepository
-	cipher                *security.Cipher
-	mu                    sync.RWMutex
-	browserUA             string
-	clearance             ClearanceManager
-	prober                NodeProber
-	operationsCache       OperationsConfigInvalidator
-	qualityProber         QualityProber
-	qualityQuarantiner    QualityAccountQuarantiner
-	qualityNodeController QualityNodeController
-	assignmentMu          sync.Mutex
-	lastAssignmentRun     time.Time
-	assignmentRunning     bool
+	repository        ServiceRepository
+	accounts          AccountBindingRepository
+	operations        OperationsRepository
+	cipher            *security.Cipher
+	mu                sync.RWMutex
+	browserUA         string
+	clearance         ClearanceManager
+	prober            NodeProber
+	operationsCache   OperationsConfigInvalidator
+	qualityProber     QualityProber
+	assignmentMu      sync.Mutex
+	lastAssignmentRun time.Time
+	assignmentRunning bool
 }
 
 func (s *Service) SetQualityProber(value QualityProber) {
 	s.mu.Lock()
 	s.qualityProber = value
-	s.qualityQuarantiner, _ = value.(QualityAccountQuarantiner)
-	s.qualityNodeController, _ = value.(QualityNodeController)
 	s.mu.Unlock()
-}
-
-func (s *Service) SetQualityNodeSuspended(ctx context.Context, nodeID uint64, suspended bool) (bool, error) {
-	if nodeID == 0 {
-		return false, fmt.Errorf("%w: nodeId 必填", ErrInvalidInput)
-	}
-	node, err := s.repository.GetEgressNode(ctx, nodeID)
-	if errors.Is(err, repository.ErrNotFound) {
-		return false, ErrNotFound
-	}
-	if err != nil {
-		return false, err
-	}
-	changed := false
-	if suspended {
-		if node.Enabled || node.LastError != domain.LastErrorQualityGuardSuspended {
-			node.Enabled = false
-			node.LastError = domain.LastErrorQualityGuardSuspended
-			changed = true
-		}
-	} else {
-		if node.LastError != domain.LastErrorQualityGuardSuspended {
-			return false, fmt.Errorf("%w: 节点不由质量守护暂停", ErrInvalidInput)
-		}
-		node.Enabled = true
-		node.LastError = ""
-		changed = true
-	}
-	if changed {
-		if _, err := s.repository.UpdateEgressNode(ctx, node); err != nil {
-			return false, err
-		}
-		s.forgetClearance(nodeID)
-	}
-	s.mu.RLock()
-	controller := s.qualityNodeController
-	s.mu.RUnlock()
-	if controller != nil {
-		controller.SetQualityNodeSuspended(nodeID, suspended)
-	}
-	return changed, nil
-}
-
-func (s *Service) QuarantineQualityAccount(ctx context.Context, accountID uint64, model string) error {
-	model = strings.TrimSpace(model)
-	if accountID == 0 || model == "" {
-		return fmt.Errorf("%w: accountId 和 model 必填", ErrInvalidInput)
-	}
-	s.mu.RLock()
-	quarantiner := s.qualityQuarantiner
-	s.mu.RUnlock()
-	if quarantiner == nil {
-		return ErrQualityProbeUnavailable
-	}
-	return quarantiner.QuarantineQualityAccount(ctx, accountID, model, DefaultQualityAccountCooldown)
 }
 
 func (s *Service) ProbeQuality(ctx context.Context, nodeID uint64, input QualityProbeInput) (QualityProbeResult, error) {
@@ -198,13 +128,15 @@ func (s *Service) ProbeQuality(ctx context.Context, nodeID uint64, input Quality
 	input.Model = strings.TrimSpace(input.Model)
 	input.Prompt = strings.TrimSpace(input.Prompt)
 	input.Expected = strings.TrimSpace(input.Expected)
+	rawMatchMode := strings.TrimSpace(input.MatchMode)
+	input.MatchMode = NormalizeMatchMode(input.MatchMode)
 	if input.Model == "" {
 		return QualityProbeResult{}, fmt.Errorf("%w: model 必填", ErrInvalidInput)
 	}
 	if input.Prompt == "" {
 		input.Prompt = DefaultQualityProbePrompt
 	}
-	if input.Expected == "" {
+	if input.Expected == "" && rawMatchMode == "" {
 		input.Expected = DefaultQualityProbeExpected
 	}
 	if len(input.Prompt) > MaxQualityProbePromptBytes || len(input.Expected) > MaxQualityProbeExpectedBytes {

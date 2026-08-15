@@ -60,6 +60,10 @@ func (h *Handler) Register(router *gin.RouterGroup) {
 	router.GET("/egress-quality-guard", h.qualityGuardStatus)
 	router.PUT("/egress-quality-guard/config", h.updateQualityGuardConfig)
 	router.POST("/egress-quality-guard/nodes/:id/test", h.testQualityGuardNode)
+	router.GET("/egress-quality-guard/profiles", h.listQualityGuardProfiles)
+	router.POST("/egress-quality-guard/profiles", h.createQualityGuardProfile)
+	router.PUT("/egress-quality-guard/profiles/:id", h.updateQualityGuardProfile)
+	router.DELETE("/egress-quality-guard/profiles/:id", h.deleteQualityGuardProfile)
 	router.POST("/egress-nodes/:id/accounts", h.assignAccounts)
 	router.DELETE("/egress-nodes/accounts", h.unassignAccounts)
 	router.PUT("/egress-nodes/:id", h.update)
@@ -84,57 +88,12 @@ func (h *Handler) RegisterQualityGuard(router *gin.RouterGroup) {
 	router.PATCH("/egress-nodes/batch", h.updateMany)
 	router.POST("/egress-nodes/:id/test", h.testNode)
 	router.POST("/egress-nodes/:id/quality-test", h.testQualityGuardNode)
-	router.PUT("/egress-nodes/:id/quality-suspension", h.updateQualitySuspension)
-	router.POST("/egress-quality-accounts/:id/quarantine", h.quarantineQualityAccount)
 	router.GET("/egress-operations", h.operationsConfig)
-}
-
-type qualitySuspensionRequest struct {
-	Suspended *bool `json:"suspended" binding:"required"`
-}
-
-func (h *Handler) updateQualitySuspension(c *gin.Context) {
-	nodeID, ok := pathID(c)
-	if !ok {
-		return
-	}
-	var request qualitySuspensionRequest
-	if c.ShouldBindJSON(&request) != nil || request.Suspended == nil {
-		response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
-		return
-	}
-	changed, err := h.service.SetQualityNodeSuspended(c.Request.Context(), nodeID, *request.Suspended)
-	if err != nil {
-		h.writeError(c, err)
-		return
-	}
-	response.Success(c, http.StatusOK, gin.H{"changed": changed, "suspended": *request.Suspended})
-}
-
-type qualityAccountQuarantineRequest struct {
-	Model string `json:"model" binding:"required"`
-}
-
-func (h *Handler) quarantineQualityAccount(c *gin.Context) {
-	accountID, ok := pathID(c)
-	if !ok {
-		return
-	}
-	var request qualityAccountQuarantineRequest
-	if c.ShouldBindJSON(&request) != nil {
-		response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
-		return
-	}
-	if err := h.service.QuarantineQualityAccount(c.Request.Context(), accountID, request.Model); err != nil {
-		h.writeQualityProbeError(c, err)
-		return
-	}
-	response.Success(c, http.StatusOK, gin.H{"quarantined": true})
 }
 
 // A fully populated 2,000-node guard state is slightly larger than 1 MiB.
 // Keep a bounded limit while leaving headroom for audit cursors and events.
-const maxQualityGuardStateBytes = 8 << 20
+const maxQualityGuardStateBytes = 1 << 20
 
 type qualityGuardState struct {
 	Version           int                              `json:"version"`
@@ -143,7 +102,6 @@ type qualityGuardState struct {
 	LastActiveCycleAt float64                          `json:"last_active_cycle_at"`
 	LastPassivePollAt float64                          `json:"last_passive_poll_at"`
 	Guard             qualityGuardConfig               `json:"guard"`
-	ProtectedNodeIDs  []string                         `json:"protected_node_ids"`
 	Nodes             map[string]qualityGuardNodeState `json:"nodes"`
 	RecentEvents      []qualityGuardEvent              `json:"recent_events"`
 	Statistics        qualityGuardStatistics           `json:"statistics"`
@@ -174,6 +132,7 @@ type qualityGuardActionStats struct {
 type qualityGuardConfig struct {
 	Mode                  string   `json:"mode"`
 	Model                 string   `json:"model"`
+	ClientKeyID           string   `json:"client_key_id"`
 	NodeIDs               []string `json:"node_ids"`
 	ActiveIntervalSeconds int      `json:"active_interval_seconds"`
 	PassivePollSeconds    int      `json:"passive_poll_seconds"`
@@ -233,17 +192,21 @@ func (h *Handler) qualityGuardStatus(c *gin.Context) {
 		"lastActiveCycleAt": state.LastActiveCycleAt,
 		"lastPassivePollAt": state.LastPassivePollAt,
 		"config": gin.H{
-			"mode": state.Guard.Mode, "model": state.Guard.Model,
+			"mode": state.Guard.Mode, "model": state.Guard.Model, "client_key_id": state.Guard.ClientKeyID,
 			"node_ids": state.Guard.NodeIDs, "active_interval_seconds": state.Guard.ActiveIntervalSeconds,
 			"passive_poll_seconds": state.Guard.PassivePollSeconds, "soft_tps": state.Guard.SoftTPS,
 			"hard_tps": state.Guard.HardTPS, "consecutive_soft": state.Guard.ConsecutiveSoft,
 			"consecutive_errors": state.Guard.ConsecutiveErrors, "quarantine_seconds": state.Guard.QuarantineSeconds,
 			"min_healthy_nodes": state.Guard.MinHealthyNodes, "max_output_tokens": state.Guard.MaxOutputTokens,
 		},
-		"nodes": state.Nodes, "protectedNodeIds": state.ProtectedNodeIDs, "recentEvents": state.RecentEvents,
+		"nodes": state.Nodes, "recentEvents": state.RecentEvents,
 	}
 	if state.Statistics.StartedAt > 0 {
 		payload["statistics"] = state.Statistics
+	}
+	if profiles, err := loadProbeProfileFile(h.profilesPath()); err == nil {
+		payload["activeProfileId"] = profiles.ActiveProfileID
+		payload["profiles"] = profiles.summaries()
 	}
 	response.Success(c, http.StatusOK, payload)
 }
@@ -392,9 +355,6 @@ func (h *Handler) readQualityGuardState() (qualityGuardState, bool, error) {
 	if state.RecentEvents == nil {
 		state.RecentEvents = []qualityGuardEvent{}
 	}
-	if state.ProtectedNodeIDs == nil {
-		state.ProtectedNodeIDs = []string{}
-	}
 	return state, true, nil
 }
 
@@ -403,32 +363,36 @@ func (h *Handler) testQualityGuardNode(c *gin.Context) {
 	if !ok {
 		return
 	}
-	if h.guardProbe.ClientKeyID == 0 || strings.TrimSpace(h.guardProbe.Model) == "" || h.guardProbe.Prompt == "" || h.guardProbe.Expected == "" {
+	if h.guardProbe.ClientKeyID == 0 || strings.TrimSpace(h.guardProbe.Model) == "" {
 		response.Error(c, http.StatusServiceUnavailable, "qualityGuardUnavailable", "质量守护配置暂不可用")
 		return
 	}
-	probe := h.guardProbe
-	if rawAccountID := strings.TrimSpace(c.Query("accountId")); rawAccountID != "" {
-		accountID, err := strconv.ParseUint(rawAccountID, 10, 64)
-		if err != nil || accountID == 0 {
-			response.Error(c, http.StatusBadRequest, "invalidAccountId", "账号 ID 无效")
-			return
-		}
-		probe.AccountID = accountID
+	var request struct {
+		ProfileID string `json:"profileId"`
 	}
-	value, err := h.service.ProbeQuality(c.Request.Context(), nodeID, probe)
+	_ = c.ShouldBindJSON(&request)
+	input, err := h.resolveProbeInput(strings.TrimSpace(request.ProfileID))
+	if err != nil {
+		response.Error(c, http.StatusBadRequest, "invalidRequest", err.Error())
+		return
+	}
+	if strings.TrimSpace(input.Prompt) == "" {
+		response.Error(c, http.StatusServiceUnavailable, "qualityGuardUnavailable", "质量守护配置暂不可用")
+		return
+	}
+	value, err := h.service.ProbeQuality(c.Request.Context(), nodeID, input)
 	if err != nil {
 		h.writeQualityProbeError(c, err)
 		return
 	}
 	response.Success(c, http.StatusOK, gin.H{
-		"requestId": value.RequestID, "nodeId": strconv.FormatUint(value.NodeID, 10), "accountId": strconv.FormatUint(value.AccountID, 10), "model": value.Model,
+		"requestId": value.RequestID, "nodeId": strconv.FormatUint(value.NodeID, 10), "model": value.Model,
 		"statusCode": value.StatusCode, "firstTokenMs": value.FirstTokenMS, "durationMs": value.DurationMS,
 		"generationMs": value.GenerationMS, "chunkCount": value.ChunkCount,
 		"outputTokens": value.OutputTokens, "reasoningTokens": value.ReasoningTokens,
 		"visibleTokens": value.VisibleTokens, "visibleCharacters": value.VisibleCharacters,
 		"outputTokensPerSecond":  value.OutputTokensPerSecond,
-		"visibleTokensPerSecond": value.VisibleTokensPerSecond, "expectedMatched": value.ExpectedMatched,
+		"visibleTokensPerSecond": value.OutputTokensPerSecond, "expectedMatched": value.ExpectedMatched,
 		"responseSha256": value.ResponseSHA256,
 	})
 }
@@ -530,10 +494,10 @@ type batchNodeUpdateRequest struct {
 
 type qualityProbeRequest struct {
 	ClientKeyID     string `json:"clientKeyId" binding:"required"`
-	AccountID       string `json:"accountId"`
 	Model           string `json:"model" binding:"required"`
 	Prompt          string `json:"prompt"`
 	Expected        string `json:"expected"`
+	MatchMode       string `json:"matchMode"`
 	MaxOutputTokens int    `json:"maxOutputTokens"`
 }
 
@@ -552,30 +516,22 @@ func (h *Handler) testQuality(c *gin.Context) {
 		response.Error(c, http.StatusBadRequest, "invalidClientKeyId", "Client Key ID 无效")
 		return
 	}
-	var accountID uint64
-	if strings.TrimSpace(request.AccountID) != "" {
-		accountID, err = strconv.ParseUint(request.AccountID, 10, 64)
-		if err != nil || accountID == 0 {
-			response.Error(c, http.StatusBadRequest, "invalidAccountId", "账号 ID 无效")
-			return
-		}
-	}
 	value, err := h.service.ProbeQuality(c.Request.Context(), nodeID, egressapp.QualityProbeInput{
-		ClientKeyID: clientKeyID, AccountID: accountID, Model: request.Model, Prompt: request.Prompt,
-		Expected: request.Expected, MaxOutputTokens: request.MaxOutputTokens,
+		ClientKeyID: clientKeyID, Model: request.Model, Prompt: request.Prompt,
+		Expected: request.Expected, MatchMode: request.MatchMode, MaxOutputTokens: request.MaxOutputTokens,
 	})
 	if err != nil {
 		h.writeQualityProbeError(c, err)
 		return
 	}
 	response.Success(c, http.StatusOK, gin.H{
-		"requestId": value.RequestID, "nodeId": strconv.FormatUint(value.NodeID, 10), "accountId": strconv.FormatUint(value.AccountID, 10), "model": value.Model,
+		"requestId": value.RequestID, "nodeId": strconv.FormatUint(value.NodeID, 10), "model": value.Model,
 		"statusCode": value.StatusCode, "firstTokenMs": value.FirstTokenMS, "durationMs": value.DurationMS,
 		"generationMs": value.GenerationMS, "chunkCount": value.ChunkCount,
 		"outputTokens": value.OutputTokens, "reasoningTokens": value.ReasoningTokens,
 		"visibleTokens": value.VisibleTokens, "visibleCharacters": value.VisibleCharacters,
 		"outputTokensPerSecond":  value.OutputTokensPerSecond,
-		"visibleTokensPerSecond": value.VisibleTokensPerSecond, "expectedMatched": value.ExpectedMatched,
+		"visibleTokensPerSecond": value.OutputTokensPerSecond, "expectedMatched": value.ExpectedMatched,
 		"responseSha256": value.ResponseSHA256,
 	})
 }

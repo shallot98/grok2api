@@ -18,6 +18,9 @@ import { Label } from "@/components/ui/label";
 import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { DegradeAccountsPanel } from "@/features/quality-guard/degrade-accounts-panel";
+import { ProbeProfilesPanel } from "@/features/quality-guard/probe-profiles-panel";
 import { getQualityGuardStatus, runQualityTest, updateQualityGuardPolicy, type QualityGuardEvent, type QualityGuardNodeState, type QualityGuardPolicy, type QualityGuardStatistics, type QualityGuardStatus, type QualityTestResult } from "@/features/quality-guard/quality-guard-api";
 import { createEgressNode, deleteEgressNodes, listAllEgressNodes, updateEgressNode, updateEgressNodesEnabled, type EgressNodeDTO, type EgressNodeInput } from "@/features/settings/settings-api";
 import { ErrorState } from "@/shared/components/data-state";
@@ -130,11 +133,9 @@ export function QualityGuardPage() {
 
   const status = statusQuery.data;
   const nodes = nodesQuery.data?.items ?? [];
-  const protectedNodeIDs = new Set(status?.protectedNodeIds ?? []);
-  const selectableNodes = nodes.filter((node) => !protectedNodeIDs.has(node.id));
-  const selectedNodes = selectableNodes.filter((node) => selectedNodeIDs.has(node.id));
-  const allNodesSelected = selectableNodes.length > 0 && selectedNodes.length === selectableNodes.length;
-  const toggleAllNodes = (checked: boolean) => setSelectedNodeIDs(checked ? new Set(selectableNodes.map((node) => node.id)) : new Set());
+  const selectedNodes = nodes.filter((node) => selectedNodeIDs.has(node.id));
+  const allNodesSelected = nodes.length > 0 && selectedNodes.length === nodes.length;
+  const toggleAllNodes = (checked: boolean) => setSelectedNodeIDs(checked ? new Set(nodes.map((node) => node.id)) : new Set());
   const toggleSelectedNode = (node: EgressNodeDTO, checked: boolean) => setSelectedNodeIDs((current) => {
     const next = new Set(current);
     if (checked) next.add(node.id);
@@ -159,6 +160,19 @@ export function QualityGuardPage() {
         )}
       />
 
+      <Tabs defaultValue="nodes">
+        <TabsList>
+          <TabsTrigger value="nodes">{t("qualityGuard.nodesTab")}</TabsTrigger>
+          <TabsTrigger value="profiles">{t("qualityGuard.profilesTab")}</TabsTrigger>
+          <TabsTrigger value="accounts">{t("qualityGuard.degrade.tab")}</TabsTrigger>
+        </TabsList>
+        <TabsContent value="profiles" className="mt-6">
+          <ProbeProfilesPanel />
+        </TabsContent>
+        <TabsContent value="accounts" className="mt-6">
+          <DegradeAccountsPanel softTPS={status?.config?.soft_tps} hardTPS={status?.config?.hard_tps} />
+        </TabsContent>
+        <TabsContent value="nodes" className="mt-6 space-y-6">
       {!status?.available ? <UnavailableState /> : (
         <>
           <section className="grid overflow-hidden rounded-lg bg-card sm:grid-cols-2 xl:grid-cols-4" aria-label={t("qualityGuard.overview")}>
@@ -189,16 +203,16 @@ export function QualityGuardPage() {
               </div>
             </div>
             <div className="overflow-x-auto">
-              <Table className="min-w-[1040px]">
+              <Table className="min-w-[960px]">
                 <TableHeader><TableRow>
-                  <TableHead className="w-10 px-3"><Checkbox checked={allNodesSelected ? true : selectedNodes.length > 0 ? "indeterminate" : false} disabled={selectableNodes.length === 0} onCheckedChange={(checked) => toggleAllNodes(checked === true)} aria-label={t("common.selectPage")} /></TableHead>
-                  <TableHead>{t("qualityGuard.node")}</TableHead><TableHead>{t("qualityGuard.state")}</TableHead><TableHead className="text-right">{t("settings.egress.accounts")}</TableHead>
+                  <TableHead className="w-10 px-3"><Checkbox checked={allNodesSelected ? true : selectedNodes.length > 0 ? "indeterminate" : false} disabled={nodes.length === 0} onCheckedChange={(checked) => toggleAllNodes(checked === true)} aria-label={t("common.selectPage")} /></TableHead>
+                  <TableHead>{t("qualityGuard.node")}</TableHead><TableHead>{t("qualityGuard.state")}</TableHead>
                   <TableHead className="text-right">{t("qualityGuard.outputTPS")}</TableHead><TableHead className="text-right">{t("qualityGuard.firstToken")}</TableHead>
                   <TableHead>{t("qualityGuard.source")}</TableHead><TableHead>{t("qualityGuard.strikes")}</TableHead>
                   <TableHead>{t("qualityGuard.lastObserved")}</TableHead><TableHead className="w-48 text-right">{t("common.actions")}</TableHead>
                 </TableRow></TableHeader>
                 <TableBody>
-                  {nodes.map((node) => <NodeRow key={node.id} node={node} protectedNode={protectedNodeIDs.has(node.id)} selected={selectedNodeIDs.has(node.id)} onSelect={(checked) => toggleSelectedNode(node, checked)} state={manualResults[node.id] ?? guardedNodes[node.id]} locale={i18n.language} status={status} testMutation={testMutation} toggleMutation={toggleNodeMutation} onEdit={openEditNode} onDelete={(value) => setDeletingNodes([value])} />)}
+                  {nodes.map((node) => <NodeRow key={node.id} node={node} selected={selectedNodeIDs.has(node.id)} onSelect={(checked) => toggleSelectedNode(node, checked)} state={manualResults[node.id] ?? guardedNodes[node.id]} locale={i18n.language} status={status} testMutation={testMutation} toggleMutation={toggleNodeMutation} onEdit={openEditNode} onDelete={(value) => setDeletingNodes([value])} />)}
                 </TableBody>
               </Table>
             </div>
@@ -224,6 +238,8 @@ export function QualityGuardPage() {
           </AlertDialog>
         </>
       )}
+        </TabsContent>
+      </Tabs>
     </div>
   );
 }
@@ -261,31 +277,30 @@ function Metric({ icon: Icon, label, value, tone }: { icon: typeof Activity; lab
   </div>;
 }
 
-function NodeRow({ node, protectedNode, selected, onSelect, state, locale, status, testMutation, toggleMutation, onEdit, onDelete }: { node: EgressNodeDTO; protectedNode: boolean; selected: boolean; onSelect: (checked: boolean) => void; state?: QualityGuardNodeState; locale: string; status: QualityGuardStatus; testMutation: UseMutationResult<QualityTestResult, Error, { nodeId: string; status: QualityGuardStatus }>; toggleMutation: UseMutationResult<{ updated: number }, Error, { node: EgressNodeDTO; enabled: boolean }>; onEdit: (node: EgressNodeDTO) => void; onDelete: (node: EgressNodeDTO) => void }) {
+function NodeRow({ node, selected, onSelect, state, locale, status, testMutation, toggleMutation, onEdit, onDelete }: { node: EgressNodeDTO; selected: boolean; onSelect: (checked: boolean) => void; state?: QualityGuardNodeState; locale: string; status: QualityGuardStatus; testMutation: UseMutationResult<QualityTestResult, Error, { nodeId: string; status: QualityGuardStatus }>; toggleMutation: UseMutationResult<{ updated: number }, Error, { node: EgressNodeDTO; enabled: boolean }>; onEdit: (node: EgressNodeDTO) => void; onDelete: (node: EgressNodeDTO) => void }) {
   const { t } = useTranslation();
   const testing = testMutation.isPending && testMutation.variables?.nodeId === node.id;
   const toggling = toggleMutation.isPending && toggleMutation.variables?.node.id === node.id;
   const classification = state?.last_classification || "unknown";
   return <TableRow>
-    <TableCell className="px-3"><Checkbox checked={selected} disabled={protectedNode} onCheckedChange={(checked) => onSelect(checked === true)} aria-label={t("common.selectItem", { name: node.name })} /></TableCell>
+    <TableCell className="px-3"><Checkbox checked={selected} onCheckedChange={(checked) => onSelect(checked === true)} aria-label={t("common.selectItem", { name: node.name })} /></TableCell>
     <TableCell><div className="font-medium">{node.name}</div><div className="mt-0.5 text-[11px] text-muted-foreground">ID {node.id}</div></TableCell>
-    <TableCell><StateBadge node={node} state={state} protectedNode={protectedNode} /></TableCell>
-    <TableCell className="text-right text-xs tabular-nums"><span className="font-medium">{node.assignedAccountCount}</span>{node.accountCapacity > 0 ? <span className="text-muted-foreground"> / {node.accountCapacity}</span> : null}</TableCell>
+    <TableCell><StateBadge node={node} state={state} /></TableCell>
     <TableCell className={cn("text-right font-mono text-xs tabular-nums", classification === "hard" && "font-medium text-destructive", classification === "soft" && "text-amber-600 dark:text-amber-400")}>{state?.last_observed_at ? formatTPS(state.last_output_tps) : "-"}</TableCell>
     <TableCell className="text-right font-mono text-xs tabular-nums">{state?.last_first_token_ms ? `${state.last_first_token_ms} ms` : "-"}</TableCell>
     <TableCell className="text-xs text-muted-foreground">{state?.last_source ? t(`qualityGuard.sources.${state.last_source}`) : "-"}</TableCell>
     <TableCell className="text-xs tabular-nums">{state ? `${state.passive_soft_strikes} / ${state.active_soft_strikes} / ${state.error_strikes}` : "-"}</TableCell>
     <TableCell className="text-xs text-muted-foreground">{formatTime(state?.last_observed_at, locale)}</TableCell>
     <TableCell className="text-right"><div className="flex items-center justify-end gap-1">
-      <Switch checked={node.enabled} disabled={toggling || protectedNode} onCheckedChange={(enabled) => toggleMutation.mutate({ node, enabled })} aria-label={t(node.enabled ? "qualityGuard.disableNode" : "qualityGuard.enableNode", { name: node.name })} />
-      <Button variant="ghost" size="sm" disabled={testing || !status.config || (!node.enabled && !state?.disabled_by_guard)} onClick={() => testMutation.mutate({ nodeId: node.id, status })}><RotateCw className={cn(testing && "animate-spin")} />{t("qualityGuard.test")}</Button>
+      <Switch checked={node.enabled} disabled={toggling} onCheckedChange={(enabled) => toggleMutation.mutate({ node, enabled })} aria-label={t(node.enabled ? "qualityGuard.disableNode" : "qualityGuard.enableNode", { name: node.name })} />
+      <Button variant="ghost" size="sm" disabled={testing || !status.config || !node.enabled || state?.disabled_by_guard} onClick={() => testMutation.mutate({ nodeId: node.id, status })}><RotateCw className={cn(testing && "animate-spin")} />{t("qualityGuard.test")}</Button>
       <DropdownMenu>
         <DropdownMenuTrigger asChild><Button type="button" variant="ghost" size="icon" className="size-8" aria-label={t("common.actions")}><MoreHorizontal /></Button></DropdownMenuTrigger>
         <DropdownMenuContent align="end">
           <DropdownMenuItem onClick={() => onEdit(node)}><Pencil />{t("common.edit")}</DropdownMenuItem>
-          <DropdownMenuItem disabled={toggling || protectedNode} onClick={() => toggleMutation.mutate({ node, enabled: !node.enabled })}>{node.enabled ? <PowerOff /> : <Power />}{t(node.enabled ? "common.disable" : "common.enable")}</DropdownMenuItem>
+          <DropdownMenuItem disabled={toggling} onClick={() => toggleMutation.mutate({ node, enabled: !node.enabled })}>{node.enabled ? <PowerOff /> : <Power />}{t(node.enabled ? "common.disable" : "common.enable")}</DropdownMenuItem>
           <DropdownMenuSeparator />
-          <DropdownMenuItem disabled={protectedNode} className="text-destructive focus:text-destructive" onClick={() => onDelete(node)}><Trash2 />{t("common.delete")}</DropdownMenuItem>
+          <DropdownMenuItem className="text-destructive focus:text-destructive" onClick={() => onDelete(node)}><Trash2 />{t("common.delete")}</DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
     </div></TableCell>
@@ -349,10 +364,9 @@ function emptyNodeInput(): EgressNodeInput {
   return { name: "", scope: "grok_build", enabled: true, proxyPool: false, accountCapacity: 0, proxyURL: "", userAgent: "", cloudflareCookies: "" };
 }
 
-function StateBadge({ node, state, protectedNode }: { node: EgressNodeDTO; state?: QualityGuardNodeState; protectedNode: boolean }) {
+function StateBadge({ node, state }: { node: EgressNodeDTO; state?: QualityGuardNodeState }) {
   const { t } = useTranslation();
   if (state?.disabled_by_guard) return <Badge variant="destructive">{t("qualityGuard.quarantined")}</Badge>;
-  if (protectedNode) return <Badge variant="secondary">{t("qualityGuard.fixedFallback")}</Badge>;
   if (!node.enabled) return <Badge variant="secondary">{t("common.disabled")}</Badge>;
   if (state?.error_strikes) return <Badge variant="outline" className="border-amber-500/40 text-amber-700 dark:text-amber-400">{t("qualityGuard.probeFailed")}</Badge>;
   if (state?.last_classification === "hard" || state?.last_classification === "soft") return <Badge variant="outline" className="border-amber-500/40 text-amber-700 dark:text-amber-400">{t("qualityGuard.suspect")}</Badge>;
@@ -384,6 +398,7 @@ function Policy({ status, onEdit }: { status: QualityGuardStatus; onEdit: () => 
     [t("qualityGuard.passiveInterval"), formatDuration(config.passive_poll_seconds)],
     [t("qualityGuard.quarantineDuration"), formatDuration(config.quarantine_seconds)],
     [t("qualityGuard.minimumNodes"), String(config.min_healthy_nodes)],
+    [t("qualityGuard.profilesTab"), status.profiles?.find((profile) => profile.id === status.activeProfileId)?.name ?? status.activeProfileId ?? "-"],
   ];
   return <section className="rounded-lg bg-card p-4 sm:p-5" aria-labelledby="guard-policy-title">
     <div className="flex items-center justify-between gap-3">
@@ -488,20 +503,16 @@ function UnavailableState() {
 
 function isFresh(status?: QualityGuardStatus): boolean {
   if (!status?.available || !status.updatedAt || !status.config) return false;
-  const expectedUpdateSeconds = status.config.mode === "active"
-    ? status.config.active_interval_seconds
-    : status.config.passive_poll_seconds;
-  return Date.now() / 1000 - status.updatedAt < Math.max(60, expectedUpdateSeconds * 3);
+  return Date.now() / 1000 - status.updatedAt < Math.max(60, status.config.passive_poll_seconds * 3);
 }
 function qualityTestState(result: QualityTestResult, status: QualityGuardStatus): QualityGuardNodeState {
   const softTPS = status.config?.soft_tps ?? 500;
   const hardTPS = status.config?.hard_tps ?? 1000;
   let classification = "healthy";
   let reason = "within_threshold";
-  if (!result.expectedMatched) { classification = "soft"; reason = "expected_marker_missing"; }
-  else if (result.outputTokens < 32) { classification = "soft"; reason = "insufficient_output_tokens"; }
-  else if (result.outputTokensPerSecond >= hardTPS) { classification = "hard"; reason = "hard_tps"; }
-  else if (result.outputTokensPerSecond >= softTPS) { classification = "soft"; reason = "soft_tps"; }
+  if (!result.expectedMatched) { classification = "hard"; reason = "expected_marker_missing"; }
+  else if (result.outputTokens >= 32 && result.outputTokensPerSecond >= hardTPS) { classification = "hard"; reason = "hard_tps"; }
+  else if (result.outputTokens >= 32 && result.outputTokensPerSecond >= softTPS) { classification = "soft"; reason = "soft_tps"; }
   const now = Date.now() / 1000;
   return {
     active_soft_strikes: classification === "soft" ? 1 : classification === "hard" ? (status.config?.consecutive_soft ?? 2) : 0,
