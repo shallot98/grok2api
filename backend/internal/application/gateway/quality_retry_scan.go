@@ -41,6 +41,7 @@ type qualityScanState struct {
 	terminal                        bool
 	holdExpired                     bool
 	firstVisibleAt                  time.Time
+	cipherOnlyReasoning             bool
 }
 
 type qualityReadResult struct {
@@ -159,19 +160,20 @@ func (s *qualityScanState) signals() QualityStreamSignals {
 		flushMS = time.Since(s.firstVisibleAt).Milliseconds()
 	}
 	return QualityStreamSignals{
-		HasThinking:       hasThinking,
-		HasReasoningDelta: s.hasThinking,
-		ReasoningStarted:  s.reasoningStarted || hasThinking,
-		VisibleTokens:     visible,
-		ReasoningTokens:   reasoningTokens,
-		OutputTokens:      output,
-		EncryptedBytes:    s.encryptedBytes,
-		EncryptedFloor:    floor,
-		UsageReported:     s.usage.Reported,
-		FirstVisible:      firstVisible,
-		VisibleFlushMS:    flushMS,
-		Terminal:          s.terminal,
-		HoldExpired:       s.holdExpired,
+		HasThinking:         hasThinking,
+		HasReasoningDelta:   s.hasThinking,
+		ReasoningStarted:    s.reasoningStarted || hasThinking,
+		VisibleTokens:       visible,
+		ReasoningTokens:     reasoningTokens,
+		OutputTokens:        output,
+		EncryptedBytes:      s.encryptedBytes,
+		EncryptedFloor:      floor,
+		UsageReported:       s.usage.Reported,
+		FirstVisible:        firstVisible,
+		VisibleFlushMS:      flushMS,
+		Terminal:            s.terminal,
+		HoldExpired:         s.holdExpired,
+		CipherOnlyReasoning: s.cipherOnlyReasoning,
 	}
 }
 
@@ -505,6 +507,7 @@ func peekQualityStream(ctx context.Context, body io.ReadCloser, protocol string,
 		protocol:                        protocol,
 		minEncryptedBytes:               cfg.MinEncryptedBytes,
 		encryptedBytesPerReasoningToken: cfg.EncryptedBytesPerReasoningToken,
+		cipherOnlyReasoning:             cfg.CipherOnlyReasoning,
 	}
 	var held bytes.Buffer
 	holdTimer := time.NewTimer(cfg.HoldTimeout)

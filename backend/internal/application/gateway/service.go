@@ -1019,6 +1019,7 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	// identity. Retrying the same pinned account would provide neither failover
 	// nor new evidence and can multiply a slow/failing probe.
 	holdCfg := s.qualityRetryConfig()
+	holdCfg.CipherOnlyReasoning = qualityModelHasCipherOnlyReasoning(input.PublicModel, route.UpstreamModel)
 	qualityHoldEnabled := shouldHoldQualityStream(input, ownership, route, operation, holdCfg)
 	qualityCrossAccountReplay := canReplayQualityHoldAcrossAccounts(input, ownership)
 	attemptPolicy := newRequestRoutingAttemptPolicy(int(s.maxAttempts.Load()), ownership != nil || input.ForcedAccountID != 0)

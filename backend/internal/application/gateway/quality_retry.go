@@ -65,6 +65,10 @@ type QualityRetryRuntime struct {
 	IdleAccountCooldown             time.Duration
 	MinEncryptedBytes               int
 	EncryptedBytesPerReasoningToken int
+	// CipherOnlyReasoning is set per request for models whose healthy
+	// streams carry thinking only as encrypted_content and then flush the
+	// whole answer at once (grok-4.20-multi-agent). Not a config knob.
+	CipherOnlyReasoning bool
 }
 
 // QualityStreamSignals is the hold classifier input. Tests drive this
@@ -86,6 +90,10 @@ type QualityStreamSignals struct {
 	VisibleFlushMS   int64
 	Terminal         bool
 	HoldExpired      bool
+	// CipherOnlyReasoning bypasses the dump detectors once ciphertext meets
+	// the floor: for these models a ciphertext-only reasoning item followed
+	// by a sub-second answer flush is the normal shape, not a fake dump.
+	CipherOnlyReasoning bool
 }
 
 // QualityVerdict is the hold decision for one upstream stream.
@@ -273,6 +281,13 @@ func ClassifyQualityHold(sig QualityStreamSignals, minOutput int64) QualityVerdi
 	if minOutput <= 0 {
 		minOutput = defaultQualityMinOutput
 	}
+	// Multi-agent never streams reasoning deltas and releases the final
+	// answer in well under 2s after ~10k+ reasoning tokens of ciphertext.
+	// Ciphertext at the floor is its thinking evidence; streams without it
+	// still fall through to the missing-thinking checks below.
+	if sig.CipherOnlyReasoning && sig.HasThinking {
+		return QualityDeliver
+	}
 	if qualityIsBurstDump(sig, minOutput) || qualityIsCipherDrool(sig, minOutput) || qualityIsFakeEncryptedDump(sig, minOutput) || qualityIsFastReasoningRatioDump(sig) {
 		return QualityWithhold
 	}
@@ -421,6 +436,17 @@ func CommitQualityHold(verdict QualityVerdict, qualityAttempt, maxAttempts int, 
 	default:
 		return QualityCommit{Action: QualityActionDeliver, Audit: false, KeepBody: true}
 	}
+}
+
+// qualityModelHasCipherOnlyReasoning reports models whose healthy streams
+// expose thinking only as encrypted_content (no summary/text deltas).
+func qualityModelHasCipherOnlyReasoning(models ...string) bool {
+	for _, value := range models {
+		if strings.Contains(strings.ToLower(value), "grok-4.20-multi-agent") {
+			return true
+		}
+	}
+	return false
 }
 
 func shouldHoldQualityStream(input Input, ownership *inferencedomain.ResponseOwnership, route modeldomain.Route, operation audit.Operation, cfg QualityRetryRuntime) bool {
